@@ -20,8 +20,9 @@ Pod::Spec.new do |s|
 
   s.dependency       'Flutter'
   s.platform         = :ios, '11.0'
-  s.dependency       'MobileVLCKit', '~> 3.6.1b1'
-  s.static_framework = true
+  # VLCKit 4 is a unified pod for all Apple platforms.
+  s.dependency       'VLCKit', '4.0.0a18'
+  s.static_framework = false
   s.swift_version    = '5.0'
 
   s.pod_target_xcconfig = {

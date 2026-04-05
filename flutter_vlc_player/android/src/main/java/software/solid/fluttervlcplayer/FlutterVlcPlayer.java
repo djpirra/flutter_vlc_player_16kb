@@ -187,11 +187,15 @@ final class FlutterVlcPlayer implements PlatformView {
 
                             case MediaPlayer.Event.Buffering:
                             case MediaPlayer.Event.TimeChanged:
+                            case MediaPlayer.Event.PositionChanged:
+                                float currentPos = mediaPlayer.getPosition();
+                                long currentTime = mediaPlayer.getTime();
+                                Log.d("VLC_DEBUG", "Event-Position: " + currentPos + ", Time: " + currentTime);
                                 eventObject.put("event", "timeChanged");
                                 eventObject.put("height", height);
                                 eventObject.put("width", width);
                                 eventObject.put("speed", mediaPlayer.getRate());
-                                eventObject.put("position", mediaPlayer.getTime());
+                                eventObject.put("position", currentTime);
                                 eventObject.put("duration", mediaPlayer.getLength());
                                 eventObject.put("buffer", event.getBuffering());
                                 eventObject.put("audioTracksCount", getAudioTracksCount());
@@ -337,7 +341,16 @@ final class FlutterVlcPlayer implements PlatformView {
     void seekTo(long location) {
         if (mediaPlayer == null) return;
 
-        mediaPlayer.setTime(location);
+        long duration = mediaPlayer.getLength();
+        Log.d("VLC_DEBUG", "seekTo requested: " + location + "ms, duration: " + duration + "ms");
+        if (duration > 0) {
+            float percent = (float) ((double) location / duration);
+            Log.d("VLC_DEBUG", "setting position to: " + percent);
+            mediaPlayer.setPosition(percent);
+        } else {
+            Log.d("VLC_DEBUG", "duration 0, setting time to: " + location);
+            mediaPlayer.setTime(location);
+        }
     }
 
     long getPosition() {
@@ -414,6 +427,12 @@ final class FlutterVlcPlayer implements PlatformView {
         if (mediaPlayer == null) return;
 
         mediaPlayer.addSlave(Media.Slave.Type.Subtitle, Uri.parse(url), isSelected);
+    }
+
+    void setSubtitleHeightScale(float scale) {
+        if (mediaPlayer == null) return;
+
+        mediaPlayer.setSpuTextScale(scale);
     }
 
     int getAudioTracksCount() {

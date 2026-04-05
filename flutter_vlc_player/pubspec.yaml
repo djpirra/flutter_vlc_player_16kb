@@ -24,6 +24,10 @@ dependencies:
   flutter_vlc_player_platform_interface: ^2.0.5
   meta: ^1.16.0
 
+dependency_overrides:
+  flutter_vlc_player_platform_interface:
+    path: /Users/lsims/Code/flutter_vlc_player_16kb/flutter_vlc_player_platform_interface
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
