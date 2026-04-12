@@ -269,7 +269,15 @@ public class VLCViewController: NSObject, FlutterPlatformView {
         guard let url = URL(string: uri) else { return }
         // Apply the current font size before the external subtitle track opens.
         self.vlcMediaPlayer.media?.addOption(":freetype-rel-fontsize=\(subtitleRelSize)")
+        let tracksBefore = self.vlcMediaPlayer.videoSubTitlesNames ?? []
+        print("[VLC-SPU] addSubtitleTrack: uri=\(url.lastPathComponent) enforce=\(isSelected) tracksBefore=\(tracksBefore)")
         self.vlcMediaPlayer.addPlaybackSlave(url, type: .subtitle, enforce: isSelected)
+        // Log tracks after a short delay so VLC has time to register the new track.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self else { return }
+            let tracksAfter = self.vlcMediaPlayer.videoSubTitlesNames ?? []
+            print("[VLC-SPU] addSubtitleTrack: tracksAfter(0.5s)=\(tracksAfter) currentIndex=\(self.vlcMediaPlayer.currentVideoSubTitleIndex)")
+        }
     }
     
     public func setSubtitleHeightScale(scale: Float) {
@@ -297,16 +305,33 @@ public class VLCViewController: NSObject, FlutterPlatformView {
         // close and reopen the subtitle ES decoder, which re-reads per-item
         // options including the new font size. This works for text-based tracks
         // (SRT, ASS); bitmap/vobsub tracks are unaffected by freetype options.
-        let currentTrack = self.vlcMediaPlayer.currentVideoSubTitleIndex
-        guard currentTrack >= 0 else {
-            // No subtitle track active yet – the stored relSize will be applied
-            // the next time a track is enabled via setSpuTrack or addSubtitleTrack.
-            return
+        //
+        // Prefer lastSetSpuTrackId over currentVideoSubTitleIndex because VLC's
+        // internal index may not have committed yet when this is called immediately
+        // after selectSubtitleTrack(at:). Using the stale internal index would
+        // restore the previously-active track (e.g. a Persian embedded subtitle)
+        // instead of the newly selected external one.
+        let trackToRestore: Int32
+        let vlcRealIndex = self.vlcMediaPlayer.currentVideoSubTitleIndex
+        if let last = lastSetSpuTrackId, last >= 0 {
+            trackToRestore = last
+        } else {
+            guard vlcRealIndex >= 0 else {
+                // No subtitle track active yet – the stored relSize will be applied
+                // the next time a track is enabled via setSpuTrack or addSubtitleTrack.
+                return
+            }
+            trackToRestore = vlcRealIndex
         }
+        print("[VLC-SPU] setSubtitleHeightScale: relSize=\(relSize) lastSet=\(String(describing: lastSetSpuTrackId)) vlcReal=\(vlcRealIndex) → restoring positional=\(trackToRestore)")
 
         self.vlcMediaPlayer.currentVideoSubTitleIndex = -1
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-            self?.vlcMediaPlayer.currentVideoSubTitleIndex = currentTrack
+            guard let self else { return }
+            // trackToRestore is already a VLC internal ID (from lastSetSpuTrackId or
+            // currentVideoSubTitleIndex), so assign it directly.
+            self.vlcMediaPlayer.currentVideoSubTitleIndex = trackToRestore
+            print("[VLC-SPU] setSubtitleHeightScale: restored internalId=\(trackToRestore), vlcAfter=\(self.vlcMediaPlayer.currentVideoSubTitleIndex)")
         }
     }
     
@@ -729,20 +754,32 @@ extension VLCMediaPlayer {
         return dict
     }
 
-    /// Returns { position: name } for subtitle tracks.
+    /// Returns { internalId: name } for subtitle tracks.
     ///
-    /// Keys are the **positional indices** in `videoSubTitlesNames` (0 = "Disabled",
-    /// 1 = first actual track, 2 = second, …). MobileVLCKit 3.x's
-    /// `currentVideoSubTitleIndex` / `libvlc_video_set_spu` interprets its
-    /// argument as this positional index.
-    /// -1 is reserved for "Off" by convention (no track selected).
+    /// Keys are the **VLC internal track IDs** from `videoSubTitlesIndexes`.
+    /// `currentVideoSubTitleIndex` / `libvlc_video_set_spu` uses these IDs directly —
+    /// NOT the positional indices in `videoSubTitlesNames`.  Using positional indices
+    /// caused an off-by-one where selecting "pt-PT" (positional 4) would activate
+    /// the track whose internal ID is 4, which is actually "Persian" (positional 3).
+    /// -1 is the disable sentinel and is always excluded.
     func subtitleTrackDictionary() -> [Int: String] {
         var dict: [Int: String] = [:]
-        let names = self.videoSubTitlesNames ?? []
+        let names   = self.videoSubTitlesNames   ?? []
+        let indices = self.videoSubTitlesIndexes ?? []
         for (i, name) in names.enumerated() {
             let label = (name as? String) ?? ""
             if label.lowercased() == "disable" || label.isEmpty { continue }
-            dict[i] = label
+            // Use the actual VLC internal ID if available, otherwise fall back to
+            // the positional index (shouldn't happen in practice).
+            let internalId: Int
+            if i < indices.count, let n = indices[i] as? NSNumber {
+                internalId = n.intValue
+            } else {
+                internalId = i
+            }
+            if internalId < 0 { continue } // skip the "Disabled" sentinel (-1)
+            dict[internalId] = label
+            print("[VLC-SPU] subtitleTrackDictionary: pos=\(i) internalId=\(internalId) label=\(label)")
         }
         return dict
     }
