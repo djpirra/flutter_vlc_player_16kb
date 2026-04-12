@@ -1,6 +1,15 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_vlc_player_16kb/flutter_vlc_player.dart';
 
+/// Test app verifying subtitle font-size options work with MobileVLCKit 3.
+///
+/// Since MobileVLCKit 3.x does not expose `currentSubTitleFontScale`,
+/// font size is applied via `--freetype-rel-fontsize=N` as a media option
+/// at player creation time. This app demonstrates that approach.
+///
+/// The "Set Scale" buttons recreate the controller with different font sizes
+/// to prove the option pipeline works end-to-end.
 void main() {
   runApp(
     MaterialApp(
@@ -15,76 +24,118 @@ class TestSubtitleApp extends StatefulWidget {
 }
 
 class _TestSubtitleAppState extends State<TestSubtitleApp> {
-  late VlcPlayerController _videoPlayerController;
+  static const _url =
+      'http://line.8kultradnscloud.ru/movie/rbEmkPVz4d/EvQs9JQ7ps/2016280.mkv';
+
+  late VlcPlayerController _controller;
+  double _fontSize = 16;
+  String _statusMessage = 'Initializing with font size 16 via --freetype-rel-fontsize…';
 
   @override
   void initState() {
     super.initState();
-    _videoPlayerController = VlcPlayerController.network(
-      'http://line.8kultradnscloud.ru/movie/rbEmkPVz4d/EvQs9JQ7ps/2016280.mkv',
+    _controller = _buildController(fontSize: _fontSize);
+  }
+
+  VlcPlayerController _buildController({required double fontSize}) {
+    final ctrl = VlcPlayerController.network(
+      _url,
       hwAcc: HwAcc.full,
-      autoPlay: true,
       options: VlcPlayerOptions(
+        // Font size is applied at media creation via the Freetype VLC flag.
+        // This is the MobileVLCKit 3-compatible approach (no currentSubTitleFontScale).
         subtitle: VlcSubtitleOptions([
-          // The goal is to prove setSubtitleHeightScale works,
-          // so we can initialize with a scale or call it later.
-          // VlcSubtitleOptions.fontSize(16), 
+          VlcSubtitleOptions.relativeFontSize(fontSize.toInt()),
+          VlcSubtitleOptions.boldStyle(true),
+          VlcSubtitleOptions.color(VlcSubtitleColor.white),
+          VlcSubtitleOptions.backgroundColor(VlcSubtitleColor.black),
+          VlcSubtitleOptions.backgroundOpacity(180),
+          VlcSubtitleOptions.outlineThickness(VlcSubtitleThickness.normal),
         ]),
       ),
     );
-    
-    // Add a listener to set scale once playing
-    _videoPlayerController.addOnInitListener(() async {
-        // Wait a bit for the player to be ready and start playback
-        await Future.delayed(const Duration(seconds: 5));
-        print('Setting subtitle scale to 0.5 (Font 8)');
-        await _videoPlayerController.setSubtitleHeightScale(0.5);
+
+    ctrl.addOnInitListener(() async {
+      if (kDebugMode) {
+        debugPrint(
+          '[TestSubtitleApp] Player initialized with --freetype-rel-fontsize=${fontSize.toInt()}',
+        );
+      }
+      if (mounted) {
+        setState(() {
+          _statusMessage =
+              'Player ready — font size ${fontSize.toInt()} via --freetype-rel-fontsize';
+        });
+      }
     });
+
+    return ctrl;
   }
 
-  @override
-  Future<void> dispose() async {
-    await _videoPlayerController.stopRendererScanning();
-    await _videoPlayerController.dispose();
-    super.dispose();
+  Future<void> _applyFontSize(double newSize) async {
+    if (mounted) {
+      setState(() {
+        _statusMessage = 'Restarting with font size ${newSize.toInt()}…';
+      });
+    }
+
+    final old = _controller;
+    await old.stopRendererScanning();
+    await old.dispose();
+
+    if (!mounted) return;
+    setState(() {
+      _fontSize = newSize;
+      _controller = _buildController(fontSize: newSize);
+      _statusMessage = 'Initialized with font size ${newSize.toInt()} (--freetype-rel-fontsize)';
+    });
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('VLC Subtitle Scale Test'),
+        title: const Text('VLC Font Size Test (MobileVLCKit 3)'),
       ),
-      body: Center(
-        child: Column(
-          children: [
-            VlcPlayer(
-              controller: _videoPlayerController,
-              aspectRatio: 16 / 9,
-              placeholder: const Center(child: CircularProgressIndicator()),
+      body: Column(
+        children: [
+          VlcPlayer(
+            controller: _controller,
+            aspectRatio: 16 / 9,
+            placeholder: const Center(child: CircularProgressIndicator()),
+          ),
+          Padding(
+            padding: const EdgeInsets.all(8),
+            child: Text(
+              _statusMessage,
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 12, color: Colors.grey),
             ),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                ElevatedButton(
-                  onPressed: () => _videoPlayerController.setSubtitleHeightScale(0.5),
-                  child: const Text('Set Font 8 (Scale 0.5)'),
-                ),
-                const SizedBox(width: 20),
-                ElevatedButton(
-                  onPressed: () => _videoPlayerController.setSubtitleHeightScale(1.0),
-                  child: const Text('Set Font 16 (Scale 1.0)'),
-                ),
-                const SizedBox(width: 20),
-                ElevatedButton(
-                  onPressed: () => _videoPlayerController.setSubtitleHeightScale(2.0),
-                  child: const Text('Set Font 32 (Scale 2.0)'),
-                ),
-              ],
-            ),
-          ],
-        ),
+          ),
+          Wrap(
+            spacing: 8,
+            children: [
+              _fontButton('Font 8', 8),
+              _fontButton('Font 14', 14),
+              _fontButton('Font 16 (default)', 16),
+              _fontButton('Font 24', 24),
+              _fontButton('Font 32', 32),
+            ],
+          ),
+        ],
       ),
     );
+  }
+
+  Widget _fontButton(String label, double size) => ElevatedButton(
+        onPressed: () => _applyFontSize(size),
+        child: Text(label),
+      );
+
+  @override
+  Future<void> dispose() async {
+    await _controller.stopRendererScanning();
+    await _controller.dispose();
+    super.dispose();
   }
 }

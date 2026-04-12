@@ -1,5 +1,5 @@
 #import <Foundation/Foundation.h>
-#import <VLCKit/VLCKit.h>
+#import <MobileVLCKit/MobileVLCKit.h>
 
 @interface VlcSeekHelper : NSObject
 

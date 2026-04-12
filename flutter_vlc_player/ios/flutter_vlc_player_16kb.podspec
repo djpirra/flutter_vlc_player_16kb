@@ -21,7 +21,7 @@ Pod::Spec.new do |s|
   s.dependency       'Flutter'
   s.platform         = :ios, '11.0'
   # VLCKit 4 is a unified pod for all Apple platforms.
-  s.dependency       'VLCKit', '4.0.0a18'
+  s.dependency       'MobileVLCKit', '3.7.3'
   s.static_framework = false
   s.swift_version    = '5.0'
 

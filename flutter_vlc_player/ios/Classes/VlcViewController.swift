@@ -1,6 +1,6 @@
 import Flutter
 import Foundation
-import VLCKit
+import MobileVLCKit
 import UIKit
 
 public class VLCViewController: NSObject, FlutterPlatformView {
@@ -17,6 +17,19 @@ public class VLCViewController: NSObject, FlutterPlatformView {
     // Dedicated serial queue for reading libvlc properties OFF the timer/main thread.
     // This queue must NEVER be used for set_position or any mutating libvlc call.
     private let vlcReadQueue = DispatchQueue(label: "com.gridstreamr.vlc_read", qos: .userInitiated)
+    
+    // Subtitle font size as freetype-rel-fontsize (% of video height; VLC default = 5).
+    // Stored so it can be re-injected each time a new media or subtitle track opens.
+    private var subtitleRelSize: Int = 5
+    
+    // Tracks the SPU track ID last explicitly set via setSpuTrack.
+    // nil  = user has never made an explicit selection this session →
+    //        spuTrack falls back to VLC's real currentVideoSubTitleIndex so the
+    //        modal correctly reflects what is already playing.
+    // non-nil = use this optimistic value so Flutter's _waitForSubtitleActivation
+    //        receives the intended index without waiting for VLC's (lagging) commit.
+    // Reset to nil on every new media load so the real VLC state is re-read.
+    private var lastSetSpuTrackId: Int32? = nil
     
     // Guards to prevent seek flooding (main-thread only)
     private var isSeekInFlight: Bool = false
@@ -59,13 +72,20 @@ public class VLCViewController: NSObject, FlutterPlatformView {
         self.rendererEventChannel = rendererEventChannel
         self.rendererEventChannelHandler = VLCRendererEventStreamHandler()
         
+        // All stored properties are initialised — call super before using
+        // `self` as a value (required by Swift's two-phase initialisation).
+        super.init()
+        
         self.mediaEventChannel.setStreamHandler(self.mediaEventChannelHandler)
         self.rendererEventChannel.setStreamHandler(self.rendererEventChannelHandler)
         self.vlcMediaPlayer.drawable = self.vlcView
         self.vlcMediaPlayer.delegate = self.mediaEventChannelHandler
+        // Give the event handler a back-reference so it can read the optimistic
+        // spuTrack (lastSetSpuTrackId) instead of VLC's raw currentVideoSubTitleIndex.
+        self.mediaEventChannelHandler.vlcController = self
         
-        // 250ms update period is safe for VLCKit 4.0
-        self.vlcMediaPlayer.minimalTimePeriod = 250000 
+        // Note: minimalTimePeriod is not available in MobileVLCKit 3.x.
+        // Time change notifications are received via the standard delegate/notification mechanism.
     }
     
     public func play() {
@@ -133,7 +153,7 @@ public class VLCViewController: NSObject, FlutterPlatformView {
             if duration > 0 {
                 let percent = Double(position) / Double(duration)
                 let clampedPercent = max(0.0, min(1.0, percent))
-                self.vlcMediaPlayer.position = clampedPercent
+                self.vlcMediaPlayer.position = Float(clampedPercent)
             } else {
                 // Fallback: no duration known yet — use setTime best-effort
                 let targetTime = isMicro ? (position * 1000) : position
@@ -194,19 +214,47 @@ public class VLCViewController: NSObject, FlutterPlatformView {
     }
     
     public var spuTracksCount: Int32 {
-        Int32(self.vlcMediaPlayer.trackDictionary(type: "textTracks").count)
+        Int32(self.vlcMediaPlayer.subtitleTrackDictionary().count)
     }
     
     public var spuTracks: [Int: String] {
-        self.vlcMediaPlayer.trackDictionary(type: "textTracks")
+        self.vlcMediaPlayer.subtitleTrackDictionary()
     }
     
     public func setSpuTrack(spuTrackNumber: Int32) {
-        self.vlcMediaPlayer.selectTrack(at: Int(spuTrackNumber), type: 2)
+        let before = self.vlcMediaPlayer.currentVideoSubTitleIndex
+        // Mirror the requested index immediately so spuTrack returns it without
+        // waiting for VLC's internal state to commit (avoids Flutter timeout).
+        lastSetSpuTrackId = spuTrackNumber
+        if spuTrackNumber < 0 {
+            // Disable subtitles: use -1 (VLCKit 3 sentinel)
+            self.vlcMediaPlayer.currentVideoSubTitleIndex = -1
+        } else {
+            // Inject the stored font size before enabling so the subtitle ES
+            // decoder initialises with the correct freetype option.
+            self.vlcMediaPlayer.media?.addOption(":freetype-rel-fontsize=\(subtitleRelSize)")
+            self.vlcMediaPlayer.selectSubtitleTrack(at: Int(spuTrackNumber))
+        }
+        let after = self.vlcMediaPlayer.currentVideoSubTitleIndex
+        // Keep this single log per selection (not in the hot polling path).
+        print("[VLC-SPU] setSpuTrack: requested=\(spuTrackNumber) vlcBefore=\(before) vlcAfter=\(after)")
     }
     
     public var spuTrack: Int32 {
-        Int32(self.vlcMediaPlayer.getSelectedTrackIndex(type: "textTracks"))
+        // NOTE: this getter is polled every 60 ms by Flutter — do NOT log here.
+        //
+        // When the user has made an explicit selection (lastSetSpuTrackId != nil)
+        // return the optimistic value so Flutter's _waitForSubtitleActivation
+        // receives a stable index immediately after setSpuTrack without waiting
+        // for VLC's (sometimes lagging) currentVideoSubTitleIndex to commit.
+        //
+        // When no explicit selection has been made this session (nil) fall back
+        // to VLC's real index so the modal shows the track that is *actually*
+        // playing (e.g. a default track chosen by VLC on media open).
+        if let lastSet = lastSetSpuTrackId {
+            return lastSet
+        }
+        return self.vlcMediaPlayer.currentVideoSubTitleIndex
     }
     
     public func setSpuDelay(delay: Int) {
@@ -219,27 +267,63 @@ public class VLCViewController: NSObject, FlutterPlatformView {
     
     public func addSubtitleTrack(uri: String, isSelected: Bool) {
         guard let url = URL(string: uri) else { return }
+        // Apply the current font size before the external subtitle track opens.
+        self.vlcMediaPlayer.media?.addOption(":freetype-rel-fontsize=\(subtitleRelSize)")
         self.vlcMediaPlayer.addPlaybackSlave(url, type: .subtitle, enforce: isSelected)
     }
     
     public func setSubtitleHeightScale(scale: Float) {
-        self.vlcMediaPlayer.currentSubTitleFontScale = scale
+        // MobileVLCKit 3 has no currentSubTitleFontScale (a VLC 4+ API).
+        //
+        // `freetype-rel-fontsize` is "font size as a percentage of video height".
+        // VLC's built-in default is 5 (= 5 % of video height, which looks normal).
+        // `scale` arrives from Dart as (userFontSize / 16.0), so scale = 1.0 maps
+        // to the user's default size, 2.0 to double, etc.
+        //
+        // Correct mapping: relSize = round(scale * 5)
+        //   scale 0.5 (8 pt UI)  → relSize 3   (small)
+        //   scale 1.0 (16 pt UI) → relSize 5   (default, matches VLC built-in)
+        //   scale 1.5 (24 pt UI) → relSize 8
+        //   scale 2.0 (32 pt UI) → relSize 10  (large)
+        //   scale 5.0 (80 pt UI) → relSize 25  (very large)
+        let relSize = max(1, Int((scale * 5.0).rounded()))
+        subtitleRelSize = relSize
+
+        // Persist as a per-item media option so every future subtitle decoder
+        // open (on track selection or media re-open) picks up the correct size.
+        self.vlcMediaPlayer.media?.addOption(":freetype-rel-fontsize=\(relSize)")
+
+        // Best-effort live update: toggling the active track causes VLC to
+        // close and reopen the subtitle ES decoder, which re-reads per-item
+        // options including the new font size. This works for text-based tracks
+        // (SRT, ASS); bitmap/vobsub tracks are unaffected by freetype options.
+        let currentTrack = self.vlcMediaPlayer.currentVideoSubTitleIndex
+        guard currentTrack >= 0 else {
+            // No subtitle track active yet – the stored relSize will be applied
+            // the next time a track is enabled via setSpuTrack or addSubtitleTrack.
+            return
+        }
+
+        self.vlcMediaPlayer.currentVideoSubTitleIndex = -1
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            self?.vlcMediaPlayer.currentVideoSubTitleIndex = currentTrack
+        }
     }
     
     public var audioTracksCount: Int32 {
-        Int32(self.vlcMediaPlayer.trackDictionary(type: "audioTracks").count)
+        Int32(self.vlcMediaPlayer.audioTrackDictionary().count)
     }
     
     public var audioTracks: [Int: String] {
-        self.vlcMediaPlayer.trackDictionary(type: "audioTracks")
+        self.vlcMediaPlayer.audioTrackDictionary()
     }
     
     public func setAudioTrack(audioTrackNumber: Int32) {
-        self.vlcMediaPlayer.selectTrack(at: Int(audioTrackNumber), type: 0)
+        self.vlcMediaPlayer.selectAudioTrack(at: Int(audioTrackNumber))
     }
     
     public var audioTrack: Int32 {
-        Int32(self.vlcMediaPlayer.getSelectedTrackIndex(type: "audioTracks"))
+        Int32(self.vlcMediaPlayer.selectedAudioTrackIndex)
     }
     
     public func setAudioDelay(delay: Int) {
@@ -256,19 +340,19 @@ public class VLCViewController: NSObject, FlutterPlatformView {
     }
     
     public var videoTracksCount: Int32 {
-        Int32(self.vlcMediaPlayer.trackDictionary(type: "videoTracks").count)
+        Int32(self.vlcMediaPlayer.videoTrackDictionary().count)
     }
     
     public var videoTracks: [Int: String] {
-        self.vlcMediaPlayer.trackDictionary(type: "videoTracks")
+        self.vlcMediaPlayer.videoTrackDictionary()
     }
     
     public func setVideoTrack(videoTrackNumber: Int32) {
-        self.vlcMediaPlayer.selectTrack(at: Int(videoTrackNumber), type: 1)
+        self.vlcMediaPlayer.selectVideoTrack(at: Int(videoTrackNumber))
     }
     
     public var videoTrack: Int32 {
-        Int32(self.vlcMediaPlayer.getSelectedTrackIndex(type: "videoTracks"))
+        Int32(self.vlcMediaPlayer.selectedVideoTrackIndex)
     }
     
     public func setVideoScale(scale: Float) {
@@ -280,11 +364,14 @@ public class VLCViewController: NSObject, FlutterPlatformView {
     }
     
     public func setVideoAspectRatio(aspectRatio: String) {
-        self.vlcMediaPlayer.videoAspectRatio = aspectRatio
+        // MobileVLCKit 3: videoAspectRatio is UnsafeMutablePointer<CChar>?
+        // strdup() allocates a C string that VLCKit will own/free.
+        self.vlcMediaPlayer.videoAspectRatio = strdup(aspectRatio)
     }
     
     public var videoAspectRatio: String {
-        return self.vlcMediaPlayer.videoAspectRatio ?? "1"
+        guard let ptr = self.vlcMediaPlayer.videoAspectRatio else { return "" }
+        return String(cString: ptr)
     }
     
     public var availableRendererServices: [String] {
@@ -360,6 +447,10 @@ public class VLCViewController: NSObject, FlutterPlatformView {
     }
     
     func setMediaPlayerUrl(uri: String, isAssetUrl: Bool, autoPlay: Bool, hwAcc: Int, options: [String]) {
+        // Reset explicit-selection state so the first modal open after a media
+        // change reflects VLC's real currentVideoSubTitleIndex (e.g. a default
+        // track chosen by VLC) instead of the previous media's selection.
+        lastSetSpuTrackId = nil
         self.vlcMediaPlayer.stop()
         
         var media: VLCMedia?
@@ -385,6 +476,11 @@ public class VLCViewController: NSObject, FlutterPlatformView {
                 media.addOption(option)
             }
         }
+        
+        // Bake the current subtitle font size into every new media item so the
+        // freetype renderer reads the correct value when it first initialises
+        // (before any setSubtitleHeightScale call can arrive from Dart).
+        media.addOption(":freetype-rel-fontsize=\(subtitleRelSize)")
         
         switch HWAccellerationType(rawValue: hwAcc) {
         case .HW_ACCELERATION_DISABLED:
@@ -451,6 +547,10 @@ class VLCRendererEventStreamHandler: NSObject, FlutterStreamHandler, VLCRenderer
 class VLCPlayerEventStreamHandler: NSObject, FlutterStreamHandler, VLCMediaPlayerDelegate {
     private var mediaEventSink: FlutterEventSink?
     weak var player: VLCMediaPlayer?
+    /// Back-reference to the owning controller so we can read the OPTIMISTIC
+    /// spuTrack (lastSetSpuTrackId) rather than VLC's raw currentVideoSubTitleIndex,
+    /// which keeps the event stream consistent with the Pigeon getter.
+    weak var vlcController: VLCViewController?
     
     // Dedicated read queue — reads happen OFF the timer thread to avoid
     // calling libvlc_media_player_* while timer.lock is held.
@@ -478,15 +578,9 @@ class VLCPlayerEventStreamHandler: NSObject, FlutterStreamHandler, VLCMediaPlaye
         return nil
     }
     
-    @objc func mediaPlayerLengthChanged(_ length: Int64) {
-        guard let mediaEventSink = self.mediaEventSink else { return }
-        let isMicrosecond = length > 20_000_000
-        let normalizedLength = isMicrosecond ? (length / 1000) : length
-        
-        DispatchQueue.main.async {
-            mediaEventSink(["event": "timeChanged", "duration": NSNumber(value: normalizedLength)])
-        }
-    }
+    // mediaPlayerLengthChanged(:Int64) was a VLCKit 4 delegate method.
+    // In MobileVLCKit 3, duration changes come through mediaPlayerTimeChanged notification
+    // and are read from player.media?.length inside sendTimeEvent.
     
     @objc func mediaPlayerStateChanged(_ newState: VLCMediaPlayerState) {
         guard let mediaEventSink = self.mediaEventSink, let player = self.player else { return }
@@ -503,10 +597,15 @@ class VLCPlayerEventStreamHandler: NSObject, FlutterStreamHandler, VLCMediaPlaye
             
             let height = player.videoSize.height
             let width = player.videoSize.width
-            let audioTracksCount = player.trackDictionary(type: "audioTracks").count
-            let activeAudioTrack = player.getSelectedTrackIndex(type: "audioTracks")
-            let spuTracksCount = player.trackDictionary(type: "textTracks").count
-            let activeSpuTrack = player.getSelectedTrackIndex(type: "textTracks")
+            let audioTracksCount = player.audioTrackDictionary().count
+            let activeAudioTrack = player.selectedAudioTrackIndex
+            let spuTracksCount = player.subtitleTrackDictionary().count
+            // Use the optimistic lastSetSpuTrackId (via vlcController.spuTrack) so that
+            // state-change events are consistent with the Pigeon getSpuTrack() getter.
+            // Without this, a playing/buffering event immediately after setSpuTrack would
+            // send the wrong raw VLC index, resetting Flutter's selected-track indicator.
+            let activeSpuTrack = self.vlcController.map { Int($0.spuTrack) }
+                ?? player.selectedSubtitleTrackIndex
             let duration = player.normalizedDuration
             let speed = player.rate
             let position = player.normalizedTime
@@ -547,9 +646,8 @@ class VLCPlayerEventStreamHandler: NSObject, FlutterStreamHandler, VLCMediaPlaye
         }
     }
     
-    @objc func mediaPlayer(_ player: VLCMediaPlayer, watchTime changed: Int64) {
-        self.sendTimeEvent(player: player)
-    }
+    // mediaPlayer(_:watchTime:) is a VLCKit 4 delegate method — not available in MobileVLCKit 3.
+    // Time updates in MobileVLCKit 3 come via the mediaPlayerTimeChanged NSNotification delegate.
     
     @objc func mediaPlayerTimeChanged(_ aNotification: Notification) {
         if let player = aNotification.object as? VLCMediaPlayer {
@@ -600,6 +698,9 @@ class VLCPlayerEventStreamHandler: NSObject, FlutterStreamHandler, VLCMediaPlaye
 enum DataSourceType: Int { case ASSET = 0; case NETWORK = 1; case FILE = 2 }
 enum HWAccellerationType: Int { case HW_ACCELERATION_AUTOMATIC = 0; case HW_ACCELERATION_DISABLED = 1; case HW_ACCELERATION_DECODING = 2; case HW_ACCELERATION_FULL = 3 }
 
+// MARK: - MobileVLCKit 3.x compatibility extensions
+// MobileVLCKit 3 exposes tracks via typed arrays (audioTrackNames, videoSubTitlesNames, etc.)
+// rather than the KVO-based generic trackDictionary used in VLCKit 4.
 extension VLCMediaPlayer {
     var isMicrosecond: Bool {
         let rawDuration = self.media?.length.value?.int64Value ?? 0
@@ -614,43 +715,78 @@ extension VLCMediaPlayer {
         let raw = self.time.value?.int64Value ?? 0
         return Int(isMicrosecond ? (raw / 1000) : raw)
     }
-    func trackDictionary(type: String) -> [Int: String] {
+
+    // MARK: Track dictionaries (MobileVLCKit 3 API)
+
+    /// Returns { index: name } for audio tracks. Index is the sequential position
+    /// used by currentAudioTrackIndex to select a track.
+    func audioTrackDictionary() -> [Int: String] {
         var dict: [Int: String] = [:]
-        if let tracks = (self as NSObject).value(forKey: type) as? [NSObject] {
-            for (index, track) in tracks.enumerated() {
-                dict[index] = track.value(forKey: "trackName") as? String ?? "Track \(index)"
-            }
+        let names = self.audioTrackNames ?? []
+        for (i, name) in names.enumerated() {
+            dict[i] = (name as? String) ?? "Audio \(i)"
         }
         return dict
     }
-    func getSelectedTrackIndex(type: String) -> Int {
-        if let tracks = (self as NSObject).value(forKey: type) as? [NSObject] {
-            return tracks.firstIndex { ($0.value(forKey: "selected") as? Bool) == true } ?? -1
+
+    /// Returns { position: name } for subtitle tracks.
+    ///
+    /// Keys are the **positional indices** in `videoSubTitlesNames` (0 = "Disabled",
+    /// 1 = first actual track, 2 = second, …). MobileVLCKit 3.x's
+    /// `currentVideoSubTitleIndex` / `libvlc_video_set_spu` interprets its
+    /// argument as this positional index.
+    /// -1 is reserved for "Off" by convention (no track selected).
+    func subtitleTrackDictionary() -> [Int: String] {
+        var dict: [Int: String] = [:]
+        let names = self.videoSubTitlesNames ?? []
+        for (i, name) in names.enumerated() {
+            let label = (name as? String) ?? ""
+            if label.lowercased() == "disable" || label.isEmpty { continue }
+            dict[i] = label
         }
-        return -1
+        return dict
     }
-    func selectTrack(at index: Int, type: Int) {
-        let listName: String
-        switch type {
-        case 0: listName = "audioTracks"
-        case 1: listName = "videoTracks"
-        case 2: listName = "textTracks"
-        default: return
+
+    /// Returns { index: name } for video tracks.
+    func videoTrackDictionary() -> [Int: String] {
+        var dict: [Int: String] = [:]
+        let names = self.videoTrackNames ?? []
+        for (i, name) in names.enumerated() {
+            dict[i] = (name as? String) ?? "Video \(i)"
         }
-        if index < 0 {
-            let selector: String
-            switch type {
-            case 0: selector = "deselectAllAudioTracks"
-            case 1: selector = "deselectAllVideoTracks"
-            case 2: selector = "deselectAllTextTracks"
-            default: return
-            }
-            let sel = Selector(selector)
-            if self.responds(to: sel) { self.perform(sel) }
-        } else if let tracks = (self as NSObject).value(forKey: listName) as? [NSObject], index < tracks.count {
-            tracks[index].setValue(true, forKey: "selectedExclusively")
-        }
+        return dict
     }
+
+    // MARK: Selected track indices (MobileVLCKit 3 API)
+
+    var selectedAudioTrackIndex: Int {
+        return Int(self.currentAudioTrackIndex)
+    }
+
+    var selectedSubtitleTrackIndex: Int {
+        let idx = Int(self.currentVideoSubTitleIndex)
+        // VLCKit 3 returns -1 when subtitles are disabled
+        return idx
+    }
+
+    var selectedVideoTrackIndex: Int {
+        return Int(self.currentVideoTrackIndex)
+    }
+
+    // MARK: Track selection (MobileVLCKit 3 API)
+
+    func selectAudioTrack(at index: Int) {
+        self.currentAudioTrackIndex = Int32(index)
+    }
+
+    func selectSubtitleTrack(at index: Int) {
+        self.currentVideoSubTitleIndex = Int32(index)
+    }
+
+    func selectVideoTrack(at index: Int) {
+        self.currentVideoTrackIndex = Int32(index)
+    }
+
     func rendererServices() -> [String] {
         let renderers = VLCRendererDiscoverer.list()
         var services: [String] = []

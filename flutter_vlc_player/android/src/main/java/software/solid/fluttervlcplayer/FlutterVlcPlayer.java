@@ -225,7 +225,6 @@ final class FlutterVlcPlayer implements PlatformView {
                             case MediaPlayer.Event.ESSelected:
                             case MediaPlayer.Event.PausableChanged:
                             case MediaPlayer.Event.SeekableChanged:
-                            case MediaPlayer.Event.PositionChanged:
                             default:
                                 break;
                         }
@@ -431,8 +430,28 @@ final class FlutterVlcPlayer implements PlatformView {
 
     void setSubtitleHeightScale(float scale) {
         if (mediaPlayer == null) return;
+        org.videolan.libvlc.interfaces.IMedia media = mediaPlayer.getMedia();
+        if (media != null) {
+            // scale is userFontSize / 16.0. Recover pixel size:
+            final int relSize = Math.max(1, Math.round(scale * 16.0f));
+            // ":" prefix = per-item option.
+            media.addOption(":freetype-rel-fontsize=" + relSize);
 
-        mediaPlayer.setSpuTextScale(scale);
+            // Toggle track to force Freetype renderer to re-read options
+            final int currentTrack = getSpuTrack();
+            if (currentTrack != -1) {
+                setSpuTrack(-1);
+                // Use the TextureView's handler to post the toggle back on the UI thread
+                textureView.postDelayed(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (mediaPlayer != null && !isDisposed) {
+                            setSpuTrack(currentTrack);
+                        }
+                    }
+                }, 150);
+            }
+        }
     }
 
     int getAudioTracksCount() {
