@@ -115,11 +115,31 @@ class _TestSubtitleAppState extends State<TestSubtitleApp> {
           Wrap(
             spacing: 8,
             children: [
-              _fontButton('Font 8', 8),
-              _fontButton('Font 14', 14),
-              _fontButton('Font 16 (default)', 16),
-              _fontButton('Font 24', 24),
-              _fontButton('Font 32', 32),
+              _FontSizeButton(
+                label: 'Font 8',
+                fontSize: 8,
+                onPressed: _applyFontSize,
+              ),
+              _FontSizeButton(
+                label: 'Font 14',
+                fontSize: 14,
+                onPressed: _applyFontSize,
+              ),
+              _FontSizeButton(
+                label: 'Font 16 (default)',
+                fontSize: 16,
+                onPressed: _applyFontSize,
+              ),
+              _FontSizeButton(
+                label: 'Font 24',
+                fontSize: 24,
+                onPressed: _applyFontSize,
+              ),
+              _FontSizeButton(
+                label: 'Font 32',
+                fontSize: 32,
+                onPressed: _applyFontSize,
+              ),
             ],
           ),
         ],
@@ -127,15 +147,30 @@ class _TestSubtitleAppState extends State<TestSubtitleApp> {
     );
   }
 
-  Widget _fontButton(String label, double size) => ElevatedButton(
-        onPressed: () => _applyFontSize(size),
-        child: Text(label),
-      );
-
   @override
   Future<void> dispose() async {
     await _controller.stopRendererScanning();
     await _controller.dispose();
     super.dispose();
+  }
+}
+
+class _FontSizeButton extends StatelessWidget {
+  const _FontSizeButton({
+    required this.label,
+    required this.fontSize,
+    required this.onPressed,
+  });
+
+  final String label;
+  final double fontSize;
+  final ValueChanged<double> onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return ElevatedButton(
+      onPressed: () => onPressed(fontSize),
+      child: Text(label),
+    );
   }
 }

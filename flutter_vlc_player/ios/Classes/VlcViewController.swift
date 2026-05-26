@@ -463,12 +463,26 @@ public class VLCViewController: NSObject, FlutterPlatformView {
         return true
     }
     
+    func updatePlaybackCaches(position: Int, duration: Int, isPlaying: Bool) {
+        self.lastKnownPosition = position
+        if duration > 0 {
+            self.lastKnownDuration = duration
+        }
+        self.lastKnownIsPlaying = isPlaying
+    }
+
     public func dispose() {
+        // Stop VLC delegate callbacks immediately so timer threads can't enqueue
+        // new `vlc_event_read` work while we're tearing down.
+        self.vlcMediaPlayer.delegate = nil
+        self.mediaEventChannelHandler.prepareForDisposeDrainingReads()
+
         self.mediaEventChannel.setStreamHandler(nil)
         self.rendererEventChannel.setStreamHandler(nil)
         self.rendererdiscoverers.removeAll()
         self.rendererEventChannelHandler.renderItems.removeAll()
         self.vlcMediaPlayer.stop()
+        self.mediaEventChannelHandler.player = nil
     }
     
     func setMediaPlayerUrl(uri: String, isAssetUrl: Bool, autoPlay: Bool, hwAcc: Int, options: [String]) {
@@ -476,6 +490,10 @@ public class VLCViewController: NSObject, FlutterPlatformView {
         // change reflects VLC's real currentVideoSubTitleIndex (e.g. a default
         // track chosen by VLC) instead of the previous media's selection.
         lastSetSpuTrackId = nil
+        // Block and drain time/state read work while stop/media swap runs so
+        // vlcReadQueue never touches VLCMediaPlayer after libvlc teardown starts.
+        self.mediaEventChannelHandler.beginPlaybackMutation()
+        defer { self.mediaEventChannelHandler.endPlaybackMutation() }
         self.vlcMediaPlayer.stop()
         
         var media: VLCMedia?
@@ -588,9 +606,41 @@ class VLCPlayerEventStreamHandler: NSObject, FlutterStreamHandler, VLCMediaPlaye
     //   Assertion failed: (!vlc_mutex_held(&player->timer.lock))
     // We cache isPlaying from state-change events (which fire on a safe thread).
     private var cachedIsPlaying: Bool = false
+    /// Duration in milliseconds, refreshed from media.length on state changes.
+    private var cachedDurationMs: Int = 0
+    /// True while stop/media swap/dispose is in progress; suppresses new reads.
+    private var isPlaybackMutationInProgress: Bool = false
     
     override init() {
         super.init()
+    }
+
+    /// Refresh duration cache from `media.length` only — never touch `player.time`
+    /// here because VLCTime can be torn down while libvlc updates the clock.
+    private func refreshDurationCache(from player: VLCMediaPlayer) {
+        let rawLength = player.media?.length.value?.int64Value ?? 0
+        guard rawLength > 0 else { return }
+        let isMicro = rawLength > 20_000_000
+        cachedDurationMs = Int(isMicro ? (rawLength / 1000) : rawLength)
+    }
+
+    /// Derive position ms from the float slider (0…1) and cached duration.
+    /// Avoids reading `player.time`, which races with libvlc on background queues.
+    private func positionMs(from player: VLCMediaPlayer) -> Int {
+        guard cachedDurationMs > 0 else { return 0 }
+        let fraction = max(0, min(1, player.position))
+        return Int((Float(cachedDurationMs) * fraction).rounded())
+    }
+
+    private func deliverMediaEvent(_ event: [String: Any]) {
+        guard let mediaEventSink = self.mediaEventSink else { return }
+        if Thread.isMainThread {
+            mediaEventSink(event)
+        } else {
+            DispatchQueue.main.async {
+                mediaEventSink(event)
+            }
+        }
     }
     
     func onListen(withArguments _: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
@@ -602,13 +652,45 @@ class VLCPlayerEventStreamHandler: NSObject, FlutterStreamHandler, VLCMediaPlaye
         self.mediaEventSink = nil
         return nil
     }
+
+    /// Blocks until queued read work on vlc_event_read completes. Safe to call
+    /// before `stop`/media teardown so VLCMediaPlayer accessors are never hit
+    /// while libvlc is tearing down another thread still posting time-change events.
+    func drainPlaybackPropertyReadQueueForSafeMutation() {
+        vlcReadQueue.sync { /* drain */ }
+    }
+
+    /// Call before `stop`/media swap: suppresses new reads and drains in-flight work.
+    func beginPlaybackMutation() {
+        isPlaybackMutationInProgress = true
+        cachedDurationMs = 0
+        vlcReadQueue.sync { /* drain legacy state-change reads */ }
+    }
+
+    /// Call after `stop`/media swap: drains stop-triggered reads, then re-enables events.
+    func endPlaybackMutation() {
+        vlcReadQueue.sync { /* drain legacy state-change reads */ }
+        isPlaybackMutationInProgress = false
+    }
+
+    /// Call while disposing or before VLCMediaPlayer teardown: clears the Flutter
+    /// sink first (so `sendTimeEvent` stops scheduling reads), then drains the
+    /// read queue before native `stop`/deallocation proceeds.
+    func prepareForDisposeDrainingReads() {
+        isPlaybackMutationInProgress = true
+        cachedDurationMs = 0
+        self.mediaEventSink = nil
+        vlcReadQueue.sync { /* drain legacy state-change reads */ }
+    }
     
     // mediaPlayerLengthChanged(:Int64) was a VLCKit 4 delegate method.
     // In MobileVLCKit 3, duration changes come through mediaPlayerTimeChanged notification
     // and are read from player.media?.length inside sendTimeEvent.
     
     @objc func mediaPlayerStateChanged(_ newState: VLCMediaPlayerState) {
-        guard let mediaEventSink = self.mediaEventSink, let player = self.player else { return }
+        guard self.mediaEventSink != nil,
+              self.player != nil,
+              !isPlaybackMutationInProgress else { return }
         
         // State-change callbacks (HandleMediaInstanceStateChanged) dispatch through
         // VLCEventsHandler. With VLCEventsDefaultConfiguration (dispatchQueue=nil),
@@ -618,7 +700,10 @@ class VLCPlayerEventStreamHandler: NSObject, FlutterStreamHandler, VLCMediaPlaye
         // However, to be extra safe, dispatch all reads to vlcReadQueue (async)
         // so they execute off whatever thread VLCKit called us on.
         self.vlcReadQueue.async { [weak self] in
-            guard let self = self else { return }
+            guard let self = self,
+                  self.mediaEventSink != nil,
+                  !self.isPlaybackMutationInProgress,
+                  let player = self.player else { return }
             
             let height = player.videoSize.height
             let width = player.videoSize.width
@@ -631,9 +716,10 @@ class VLCPlayerEventStreamHandler: NSObject, FlutterStreamHandler, VLCMediaPlaye
             // send the wrong raw VLC index, resetting Flutter's selected-track indicator.
             let activeSpuTrack = self.vlcController.map { Int($0.spuTrack) }
                 ?? player.selectedSubtitleTrackIndex
-            let duration = player.normalizedDuration
+            self.refreshDurationCache(from: player)
+            let duration = self.cachedDurationMs
             let speed = player.rate
-            let position = player.normalizedTime
+            let position = self.positionMs(from: player)
             // SAFE here: state-change callback thread does not hold timer.lock
             let isPlaying = player.isPlaying
             let isSeekable = player.isSeekable
@@ -665,9 +751,12 @@ class VLCPlayerEventStreamHandler: NSObject, FlutterStreamHandler, VLCMediaPlaye
             default: break
             }
             
-            DispatchQueue.main.async {
-                mediaEventSink(event)
-            }
+            self.vlcController?.updatePlaybackCaches(
+                position: position,
+                duration: duration,
+                isPlaying: isPlaying
+            )
+            self.deliverMediaEvent(event)
         }
     }
     
@@ -675,48 +764,38 @@ class VLCPlayerEventStreamHandler: NSObject, FlutterStreamHandler, VLCMediaPlaye
     // Time updates in MobileVLCKit 3 come via the mediaPlayerTimeChanged NSNotification delegate.
     
     @objc func mediaPlayerTimeChanged(_ aNotification: Notification) {
-        if let player = aNotification.object as? VLCMediaPlayer {
-            self.sendTimeEvent(player: player)
-        }
+        guard let notificationPlayer = aNotification.object as? VLCMediaPlayer,
+              notificationPlayer === self.player else { return }
+        self.sendTimeEvent()
     }
 
-    /// CRITICAL: This method may be called from VLCKit's timer thread which holds
-    /// timer.lock (HandleWatchTimeUpdate/HandleWatchTimeOnSeek run inline because
-    /// VLCEventsDefaultConfiguration.dispatchQueue returns nil).
-    ///
-    /// We MUST NOT call any libvlc_media_player_* function here because those
-    /// need vlc_player_Lock, and calling vlc_player_Lock while timer.lock is
-    /// held triggers:
-    ///   Assertion failed: (!vlc_mutex_held(&player->timer.lock))
-    ///
-    /// Strategy: dispatch reads to vlcReadQueue.async. By the time our block
-    /// executes, the timer callback has returned and released timer.lock.
-    /// Use cachedIsPlaying instead of player.isPlaying.
-    private func sendTimeEvent(player: VLCMediaPlayer) {
-        guard let mediaEventSink = self.mediaEventSink else { return }
+    /// Called directly from `mediaPlayerTimeChanged` while VLCKit's time snapshot
+    /// is still valid. Never defer to vlcReadQueue — deferred reads of
+    /// `player.time` / `VLCTime.value` race with the next tick and can SIGSEGV.
+    /// Use `player.position` (float 0…1) × cached duration instead of `player.time`.
+    private func sendTimeEvent() {
+        guard self.mediaEventSink != nil,
+              !isPlaybackMutationInProgress,
+              let player = self.player else { return }
         
-        // Snapshot the cached value BEFORE dispatching (safe atomic read)
         let isPlaying = self.cachedIsPlaying
-        
-        // Dispatch reads to the read queue — this ensures we're NOT on the
-        // timer thread when we access player.time / player.media.length.
-        // These properties use dispatch_sync(_timeChangeLockQueue) internally
-        // which is safe as long as we're not on the timer thread.
-        self.vlcReadQueue.async { [weak self] in
-            guard self != nil else { return }
-            
-            let duration = player.normalizedDuration
-            let position = player.normalizedTime
-            
-            DispatchQueue.main.async {
-                mediaEventSink([
-                    "event": "timeChanged",
-                    "duration": duration,
-                    "position": position,
-                    "isPlaying": isPlaying,
-                ])
-            }
+        if cachedDurationMs <= 0 {
+            refreshDurationCache(from: player)
         }
+        let duration = cachedDurationMs
+        let position = positionMs(from: player)
+        
+        vlcController?.updatePlaybackCaches(
+            position: position,
+            duration: duration,
+            isPlaying: isPlaying
+        )
+        deliverMediaEvent([
+            "event": "timeChanged",
+            "duration": duration,
+            "position": position,
+            "isPlaying": isPlaying,
+        ])
     }
 }
 
@@ -727,18 +806,21 @@ enum HWAccellerationType: Int { case HW_ACCELERATION_AUTOMATIC = 0; case HW_ACCE
 // MobileVLCKit 3 exposes tracks via typed arrays (audioTrackNames, videoSubTitlesNames, etc.)
 // rather than the KVO-based generic trackDictionary used in VLCKit 4.
 extension VLCMediaPlayer {
-    var isMicrosecond: Bool {
+    /// True when `media.length` is expressed in microseconds (VLC live/TS streams).
+    var lengthUsesMicroseconds: Bool {
         let rawDuration = self.media?.length.value?.int64Value ?? 0
-        let rawTime = self.time.value?.int64Value ?? 0
-        return rawDuration > 20_000_000 || rawTime > 20_000_000
+        return rawDuration > 20_000_000
     }
     var normalizedDuration: Int {
         let raw = self.media?.length.value?.int64Value ?? 0
-        return Int(isMicrosecond ? (raw / 1000) : raw)
+        guard raw > 0 else { return 0 }
+        return Int(lengthUsesMicroseconds ? (raw / 1000) : raw)
     }
     var normalizedTime: Int {
         let raw = self.time.value?.int64Value ?? 0
-        return Int(isMicrosecond ? (raw / 1000) : raw)
+        guard raw > 0 else { return 0 }
+        let isMicro = lengthUsesMicroseconds || raw > 20_000_000
+        return Int(isMicro ? (raw / 1000) : raw)
     }
 
     // MARK: Track dictionaries (MobileVLCKit 3 API)

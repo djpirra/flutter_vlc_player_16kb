@@ -45,7 +45,10 @@ void main() {
       expect(parsedSize, equals(targetSize));
 
       // Verify scale calculation (gridstreamr base is 16.0)
-      final scale = parsedSize! / 16.0;
+      if (parsedSize == null) {
+        fail('parsedSize should have been set from subtitle options');
+      }
+      final scale = parsedSize / 16.0;
       expect(scale, closeTo(1.5, 0.001)); // 24 / 16 = 1.5
     });
 
