@@ -51,6 +51,19 @@ public class VLCViewController: NSObject, FlutterPlatformView {
     // to give VLC a unique URL that forces a fresh FreeType decoder.
     // Reset on every new media load.
     private var lastExternalSubtitleData: Data? = nil
+
+    // Xtream / Smart Collections: sidecar probe + embedded extraction run
+    // asynchronously after setSpuTrack. While in flight, defer embedded font-size
+    // reloads (they are unreliable and race with external promotion).
+    private var sidecarPromotionInProgress = false
+    private var sidecarCandidateQueue: [URL] = []
+    private var sidecarCandidateTrackIndex: Int32 = -1
+    private var pendingSubtitleScaleAfterPromotion: Float? = nil
+    private var subtitleExtractor: VLCMediaPlayer?
+    private var subtitleExtractTimer: Timer?
+    private var subtitleExtractDestPath: String = ""
+    private var subtitleExtractTrackIndex: Int32 = -1
+    private var subtitleExtractGeneration: Int = 0
     
     // Caches — updated only from safe contexts, read from main thread
     private var lastKnownPosition: Int = 0
@@ -267,9 +280,15 @@ public class VLCViewController: NSObject, FlutterPlatformView {
         // Xtream / Smart Collections: embedded container subs cannot resize without a
         // full media reload (unreliable). Try a heuristic sidecar .srt URL so we
         // land on the external path (lastExternalSubtitleData) when the provider
-        // hosts a sibling SRT file next to the MKV/MP4.
+        // hosts a sibling SRT file next to the MKV/MP4, then extract embedded
+        // text subs to a temp SRT when no sidecar exists.
         if spuTrackNumber >= 0 && lastExternalSubtitleData == nil {
-            tryPromoteHeuristicXtreamSidecar(trackIndex: spuTrackNumber)
+            if !sidecarPromotionInProgress || sidecarCandidateTrackIndex != spuTrackNumber {
+                cancelSubtitlePromotionWork()
+                sidecarCandidateTrackIndex = spuTrackNumber
+                sidecarPromotionInProgress = true
+                tryPromoteHeuristicXtreamSidecar(trackIndex: spuTrackNumber)
+            }
         }
     }
     
@@ -337,34 +356,81 @@ public class VLCViewController: NSObject, FlutterPlatformView {
 
     /// Downloads a subtitle from [networkUrl] to a unique temp ASS file (converted
     /// from SRT), then adds it via addPlaybackSlave on the main thread.
-    private func downloadSubtitleThenAdd(networkUrl: URL, isSelected: Bool) {
+    private func downloadSubtitleThenAdd(
+        networkUrl: URL,
+        isSelected: Bool,
+        completion: ((Bool) -> Void)? = nil
+    ) {
         URLSession.shared.dataTask(with: networkUrl) { [weak self] data, _, error in
-            guard let self else { return }
+            guard let self else {
+                DispatchQueue.main.async { completion?(false) }
+                return
+            }
             if let error = error {
                 print("[VLC-SPU] downloadSubtitleThenAdd: download failed: \(error.localizedDescription)")
+                DispatchQueue.main.async { completion?(false) }
                 return
             }
             guard let data = data, !data.isEmpty else {
                 print("[VLC-SPU] downloadSubtitleThenAdd: empty response for \(networkUrl.lastPathComponent)")
+                DispatchQueue.main.async { completion?(false) }
                 return
             }
-            // Cache raw SRT bytes so we can regenerate ASS with any font size later.
             DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.lastExternalSubtitleData = data
-                // Convert SRT → ASS with the current font size baked into the style.
-                let srtString = String(data: data, encoding: .utf8)
-                              ?? String(data: data, encoding: .isoLatin1)
-                              ?? ""
-                let assData = srtString.isEmpty
-                    ? data
-                    : (self.srtToAssData(srtContent: srtString, relFontSize: self.subtitleRelSize) ?? data)
-                let ext = srtString.isEmpty ? "srt" : "ass"
-                guard let tmpUrl = self.writeTempSubtitleFile(data: assData, ext: ext) else { return }
-                self.lastExternalSubtitleUrl = tmpUrl
-                self._doAddSubtitleSlave(localUrl: tmpUrl, isSelected: isSelected)
+                guard let self else {
+                    completion?(false)
+                    return
+                }
+                self.finishExternalSubtitleFromData(data, isSelected: isSelected)
+                completion?(true)
             }
         }.resume()
+    }
+
+    /// Converts cached SRT bytes to ASS, stores them for resize, and adds the slave.
+    private func finishExternalSubtitleFromData(_ data: Data, isSelected: Bool) {
+        sidecarPromotionInProgress = false
+        lastExternalSubtitleData = data
+        let srtString = String(data: data, encoding: .utf8)
+                      ?? String(data: data, encoding: .isoLatin1)
+                      ?? ""
+        let assData = srtString.isEmpty
+            ? data
+            : (srtToAssData(srtContent: srtString, relFontSize: subtitleRelSize) ?? data)
+        let ext = srtString.isEmpty ? "srt" : "ass"
+        guard let tmpUrl = writeTempSubtitleFile(data: assData, ext: ext) else {
+            completeSubtitlePromotionFailure()
+            return
+        }
+        lastExternalSubtitleUrl = tmpUrl
+        _doAddSubtitleSlave(localUrl: tmpUrl, isSelected: isSelected)
+        reapplyPendingSubtitleScaleAfterPromotion()
+    }
+
+    private func reapplyPendingSubtitleScaleAfterPromotion() {
+        guard let pendingScale = pendingSubtitleScaleAfterPromotion else { return }
+        pendingSubtitleScaleAfterPromotion = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            self?.setSubtitleHeightScale(scale: pendingScale)
+        }
+    }
+
+    private func completeSubtitlePromotionFailure() {
+        sidecarPromotionInProgress = false
+        reapplyPendingSubtitleScaleAfterPromotion()
+    }
+
+    private func cancelSubtitlePromotionWork() {
+        sidecarCandidateQueue.removeAll()
+        sidecarCandidateTrackIndex = -1
+        sidecarPromotionInProgress = false
+        subtitleExtractGeneration += 1
+        subtitleExtractTimer?.invalidate()
+        subtitleExtractTimer = nil
+        subtitleExtractor?.stop()
+        subtitleExtractor = nil
+        subtitleExtractDestPath = ""
+        subtitleExtractTrackIndex = -1
     }
 
     /// Converts SRT-formatted string to ASS subtitle data with an explicit font size.
@@ -450,20 +516,129 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     /// Attempts to download a sibling `.srt` for Xtream movie/series URLs so
     /// font-size changes use the external-subtitle path (no media reload).
     private func tryPromoteHeuristicXtreamSidecar(trackIndex: Int32) {
-        guard !lastMediaUri.isEmpty else { return }
-        guard lastMediaUri.contains("/movie/") || lastMediaUri.contains("/series/") else { return }
-        guard let sourceUrl = URL(string: lastMediaUri) else { return }
-
-        var candidates: [URL] = []
-        let base = sourceUrl.deletingPathExtension()
-        candidates.append(base.appendingPathExtension("srt"))
-        candidates.append(URL(string: base.absoluteString + "_\(trackIndex).srt") ?? base.appendingPathExtension("srt"))
-        candidates.append(URL(string: base.absoluteString + ".\(trackIndex).srt") ?? base.appendingPathExtension("srt"))
-
-        for candidate in candidates {
-            print("[VLC-SPU] tryPromoteHeuristicXtreamSidecar: probing \(candidate.lastPathComponent)")
-            downloadSubtitleThenAdd(networkUrl: candidate, isSelected: true)
+        guard !lastMediaUri.isEmpty else {
+            completeSubtitlePromotionFailure()
             return
+        }
+        guard lastMediaUri.contains("/movie/") || lastMediaUri.contains("/series/") else {
+            completeSubtitlePromotionFailure()
+            return
+        }
+        guard let sourceUrl = URL(string: lastMediaUri) else {
+            completeSubtitlePromotionFailure()
+            return
+        }
+
+        let base = sourceUrl.deletingPathExtension()
+        sidecarCandidateQueue = [
+            base.appendingPathExtension("srt"),
+            URL(string: base.absoluteString + "_\(trackIndex).srt") ?? base.appendingPathExtension("srt"),
+            URL(string: base.absoluteString + ".\(trackIndex).srt") ?? base.appendingPathExtension("srt"),
+        ]
+        tryNextSidecarCandidate()
+    }
+
+    private func tryNextSidecarCandidate() {
+        guard lastExternalSubtitleData == nil else {
+            completeSubtitlePromotionFailure()
+            return
+        }
+        guard !sidecarCandidateQueue.isEmpty else {
+            tryExtractEmbeddedSubtitleTrack(trackIndex: sidecarCandidateTrackIndex)
+            return
+        }
+        let candidate = sidecarCandidateQueue.removeFirst()
+        print("[VLC-SPU] tryPromoteHeuristicXtreamSidecar: probing \(candidate.lastPathComponent)")
+        downloadSubtitleThenAdd(networkUrl: candidate, isSelected: true) { [weak self] success in
+            guard let self else { return }
+            if success {
+                print("[VLC-SPU] tryPromoteHeuristicXtreamSidecar: loaded \(candidate.lastPathComponent)")
+            } else {
+                self.tryNextSidecarCandidate()
+            }
+        }
+    }
+
+    /// Demuxes an embedded text subtitle track to a temp SRT via a secondary
+    /// headless player, then promotes it to the external resize path.
+    private func tryExtractEmbeddedSubtitleTrack(trackIndex: Int32) {
+        guard trackIndex >= 0 else {
+            completeSubtitlePromotionFailure()
+            return
+        }
+        guard lastExternalSubtitleData == nil else {
+            completeSubtitlePromotionFailure()
+            return
+        }
+        guard !lastMediaUri.isEmpty, let sourceUrl = URL(string: lastMediaUri) else {
+            completeSubtitlePromotionFailure()
+            return
+        }
+
+        subtitleExtractor?.stop()
+        subtitleExtractor = nil
+        subtitleExtractTimer?.invalidate()
+        subtitleExtractTimer = nil
+
+        let generation = subtitleExtractGeneration + 1
+        subtitleExtractGeneration = generation
+        subtitleExtractTrackIndex = trackIndex
+
+        let ts = Int(Date().timeIntervalSince1970 * 1000)
+        let dstPath = (NSTemporaryDirectory() as NSString).appendingPathComponent("gs_extract_\(ts).srt")
+        try? FileManager.default.removeItem(atPath: dstPath)
+        subtitleExtractDestPath = dstPath
+
+        let media = VLCMedia(url: sourceUrl)
+        media.addOption(":no-video")
+        media.addOption(":no-audio")
+        media.addOption(":network-caching=30000")
+        media.addOption(":sub-track-id=\(trackIndex)")
+        media.addOption(":sout=#transcode{vcodec=none,acodec=none,scodec=txt}:std{access=file,mux=raw,dst=\(dstPath)}")
+
+        let extractor = VLCMediaPlayer(library: vlcMediaPlayer.library)
+        extractor.media = media
+        subtitleExtractor = extractor
+
+        print("[VLC-SPU] tryExtractEmbeddedSubtitleTrack: track=\(trackIndex) dst=\(dstPath)")
+        extractor.play()
+
+        var attempts = 0
+        subtitleExtractTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] timer in
+            guard let self else {
+                timer.invalidate()
+                return
+            }
+            guard generation == self.subtitleExtractGeneration else {
+                timer.invalidate()
+                return
+            }
+            attempts += 1
+            let size = (try? FileManager.default.attributesOfItem(atPath: dstPath)[.size] as? Int) ?? 0
+            let state = extractor.state
+            let finished = size > 64 || state == .stopped || state == .ended || state == .error
+            let timedOut = attempts >= 180
+
+            if finished || timedOut {
+                timer.invalidate()
+                self.subtitleExtractTimer = nil
+                extractor.stop()
+                self.subtitleExtractor = nil
+
+                if size > 64, let data = try? Data(contentsOf: URL(fileURLWithPath: dstPath)) {
+                    let preview = String(data: data.prefix(256), encoding: .utf8) ?? ""
+                    let looksLikeTextSub = preview.contains("-->") || preview.contains("Dialogue:")
+                    if looksLikeTextSub {
+                        print("[VLC-SPU] tryExtractEmbeddedSubtitleTrack: success bytes=\(data.count)")
+                        self.finishExternalSubtitleFromData(data, isSelected: true)
+                        return
+                    }
+                    print("[VLC-SPU] tryExtractEmbeddedSubtitleTrack: output not text-based (PGS?) bytes=\(data.count)")
+                } else {
+                    print("[VLC-SPU] tryExtractEmbeddedSubtitleTrack: failed size=\(size) state=\(state.rawValue) timedOut=\(timedOut)")
+                }
+                self.completeSubtitlePromotionFailure()
+            }
         }
     }
 
@@ -569,6 +744,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         //   back to the saved position and restore track selections.  The reload is
         //   debounced 1.5 s so rapid +/- taps only fire once.
         // ─────────────────────────────────────────────────────────────────────
+
+        if sidecarPromotionInProgress && lastExternalSubtitleData == nil {
+            pendingSubtitleScaleAfterPromotion = scale
+            print("[VLC-SPU] setSubtitleHeightScale: deferred (subtitle promotion in progress) relSize=\(relSize)")
+            return
+        }
 
         if let subData = lastExternalSubtitleData {
             let capturedRelSize = relSize
@@ -828,6 +1009,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     }
 
     public func dispose() {
+        cancelSubtitlePromotionWork()
+        pendingSubtitleScaleAfterPromotion = nil
         // Stop VLC delegate callbacks immediately so timer threads can't enqueue
         // new `vlc_event_read` work while we're tearing down.
         self.vlcMediaPlayer.delegate = nil
@@ -847,6 +1030,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         lastSetSpuTrackId = nil
         lastExternalSubtitleUrl = nil
         lastExternalSubtitleData = nil
+        cancelSubtitlePromotionWork()
+        pendingSubtitleScaleAfterPromotion = nil
         pendingSubtitleSizeRestore?.cancel()
         pendingSubtitleSizeRestore = nil
         // Remember the load parameters so we can reload for embedded subtitle resize.
