@@ -301,13 +301,16 @@ public class VLCViewController: NSObject, FlutterPlatformView {
         // `scale` arrives from Dart as (userFontSize / 16.0), so scale = 1.0 maps
         // to the user's default size, 2.0 to double, etc.
         //
-        // Correct mapping: relSize = round(scale * 5)
-        //   scale 0.5 (8 pt UI)  → relSize 3   (small)
-        //   scale 1.0 (16 pt UI) → relSize 5   (default, matches VLC built-in)
-        //   scale 1.5 (24 pt UI) → relSize 8
-        //   scale 2.0 (32 pt UI) → relSize 10  (large)
-        //   scale 5.0 (80 pt UI) → relSize 25  (very large)
-        let relSize = max(1, Int((scale * 5.0).rounded()))
+        // Dart sends `scale = userFontSize / 16.0`.  The initial VLC flag
+        // (--freetype-rel-fontsize=N) is set directly to `userFontSize`, so
+        // we must invert the same ratio here:  relSize = round(scale * 16).
+        //   scale 0.5 ( 8 pt UI) → relSize  8   (small)
+        //   scale 0.625(10 pt UI) → relSize 10   (matches the app default)
+        //   scale 0.75 (12 pt UI) → relSize 12
+        //   scale 1.0  (16 pt UI) → relSize 16   (large)
+        //   scale 1.5  (24 pt UI) → relSize 24   (very large)
+        //   scale 2.0  (32 pt UI) → relSize 32   (enormous)
+        let relSize = max(1, Int((scale * 16.0).rounded()))
         subtitleRelSize = relSize
 
         // Persist as a per-item media option so every future subtitle decoder
@@ -911,7 +914,6 @@ extension VLCMediaPlayer {
             }
             if internalId < 0 { continue } // skip the "Disabled" sentinel (-1)
             dict[internalId] = label
-            print("[VLC-SPU] subtitleTrackDictionary: pos=\(i) internalId=\(internalId) label=\(label)")
         }
         return dict
     }
