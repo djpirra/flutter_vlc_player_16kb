@@ -263,6 +263,14 @@ public class VLCViewController: NSObject, FlutterPlatformView {
         let after = self.vlcMediaPlayer.currentVideoSubTitleIndex
         // Keep this single log per selection (not in the hot polling path).
         print("[VLC-SPU] setSpuTrack: requested=\(spuTrackNumber) vlcBefore=\(before) vlcAfter=\(after)")
+
+        // Xtream / Smart Collections: embedded container subs cannot resize without a
+        // full media reload (unreliable). Try a heuristic sidecar .srt URL so we
+        // land on the external path (lastExternalSubtitleData) when the provider
+        // hosts a sibling SRT file next to the MKV/MP4.
+        if spuTrackNumber >= 0 && lastExternalSubtitleData == nil {
+            tryPromoteHeuristicXtreamSidecar(trackIndex: spuTrackNumber)
+        }
     }
     
     public var spuTrack: Int32 {
@@ -439,6 +447,26 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         return "\(h):\(hmsParts[1]):\(hmsParts[2]).\(cs)"
     }
 
+    /// Attempts to download a sibling `.srt` for Xtream movie/series URLs so
+    /// font-size changes use the external-subtitle path (no media reload).
+    private func tryPromoteHeuristicXtreamSidecar(trackIndex: Int32) {
+        guard !lastMediaUri.isEmpty else { return }
+        guard lastMediaUri.contains("/movie/") || lastMediaUri.contains("/series/") else { return }
+        guard let sourceUrl = URL(string: lastMediaUri) else { return }
+
+        var candidates: [URL] = []
+        let base = sourceUrl.deletingPathExtension()
+        candidates.append(base.appendingPathExtension("srt"))
+        candidates.append(URL(string: base.absoluteString + "_\(trackIndex).srt") ?? base.appendingPathExtension("srt"))
+        candidates.append(URL(string: base.absoluteString + ".\(trackIndex).srt") ?? base.appendingPathExtension("srt"))
+
+        for candidate in candidates {
+            print("[VLC-SPU] tryPromoteHeuristicXtreamSidecar: probing \(candidate.lastPathComponent)")
+            downloadSubtitleThenAdd(networkUrl: candidate, isSelected: true)
+            return
+        }
+    }
+
     /// Writes [data] to a unique temp file with the given extension and returns its URL.
     private func writeTempSubtitleFile(data: Data, ext: String = "ass") -> URL? {
         let ts  = Int(Date().timeIntervalSince1970 * 1000)
@@ -465,6 +493,39 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         }
     }
     
+    /// Restores a subtitle (and audio) track after a media reload.
+    /// Prefers matching by `trackLabel` (survives index shifts on reload); falls back
+    /// to `trackIndex` if no label was captured or no match is found.
+    /// Retries every 500 ms until VLC accepts the selection or attempts run out.
+    private func retryRestoreSubtitleTrack(trackIndex: Int32, trackLabel: String?, audioTrack: Int32, remainingAttempts: Int) {
+        if audioTrack >= 0 {
+            vlcMediaPlayer.selectAudioTrack(at: Int(audioTrack))
+        }
+
+        // Resolve the best track index to use: prefer by label to survive index shifts.
+        var resolvedIndex = trackIndex
+        if let label = trackLabel,
+           let tracks = vlcMediaPlayer.videoSubTitlesNames as? [Int: String],
+           let match = tracks.first(where: { $0.value == label }) {
+            resolvedIndex = Int32(match.key)
+        }
+
+        if resolvedIndex >= 0 {
+            vlcMediaPlayer.currentVideoSubTitleIndex = resolvedIndex
+            lastSetSpuTrackId = resolvedIndex
+        }
+        let actual = vlcMediaPlayer.currentVideoSubTitleIndex
+        print("[VLC-SPU] retryRestoreSubtitleTrack: attempt resolved=\(resolvedIndex) vlcReal=\(actual) remaining=\(remainingAttempts)")
+        if actual == resolvedIndex || remainingAttempts <= 1 {
+            print("[VLC-SPU] retryRestoreSubtitleTrack: \(actual == resolvedIndex ? "success" : "gave up") track=\(resolvedIndex)")
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self else { return }
+            self.retryRestoreSubtitleTrack(trackIndex: trackIndex, trackLabel: trackLabel, audioTrack: audioTrack, remainingAttempts: remainingAttempts - 1)
+        }
+    }
+
     public func setSubtitleHeightScale(scale: Float) {
         // MobileVLCKit 3 has no currentSubTitleFontScale (a VLC 4+ API).
         //
@@ -580,10 +641,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         let capturedIsAsset = lastMediaIsAsset
         let capturedHwAcc   = lastMediaHwAcc
         let capturedOptions = lastMediaOptions
+        // Capture the track LABEL so we can re-match by name after reload even if
+        // VLC assigns a different index to the same track in the restarted session.
+        let capturedLabel: String? = (vlcMediaPlayer.videoSubTitlesNames as? [Int: String])?[Int(trackToRestore)]
 
         let workItem = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            print("[VLC-SPU] setSubtitleHeightScale (embedded): reloading media relSize=\(capturedRelSize) pos=\(capturedPos)ms")
+            print("[VLC-SPU] setSubtitleHeightScale (embedded): reloading media relSize=\(capturedRelSize) pos=\(capturedPos)ms label=\(capturedLabel ?? "?")")
 
             // Build a fresh VLCMedia with the updated freetype option.
             var media: VLCMedia?
@@ -597,6 +661,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             guard let media else { return }
             for opt in capturedOptions { media.addOption(opt) }
             media.addOption(":freetype-rel-fontsize=\(capturedRelSize)")
+            // Bake the start position into the media so VLC begins playback at the
+            // right point without a separate async seek (avoids timing races).
+            let startTimeSec = max(0, (capturedPos - 2000)) / 1000   // 2 s back-buffer
+            media.addOption("--start-time=\(startTimeSec)")
             self.subtitleRelSize = capturedRelSize
 
             self.mediaEventChannelHandler.beginPlaybackMutation()
@@ -605,22 +673,17 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             self.vlcMediaPlayer.play()
             self.mediaEventChannelHandler.endPlaybackMutation()
 
-            // After the stream begins buffering, seek to the saved position
-            // and restore the subtitle + audio track selections.
+            // Restore audio and subtitle track selections after VLC begins parsing
+            // the container.  Prefer matching by label (survives index shifts);
+            // fall back to the original index if no label was captured.
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
                 guard let self else { return }
-                self.executeSeek(position: capturedPos)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                    guard let self else { return }
-                    if capturedAudio >= 0 {
-                        self.vlcMediaPlayer.selectAudioTrack(at: Int(capturedAudio))
-                    }
-                    if capturedTrack >= 0 {
-                        self.vlcMediaPlayer.currentVideoSubTitleIndex = capturedTrack
-                        self.lastSetSpuTrackId = capturedTrack
-                    }
-                    print("[VLC-SPU] setSubtitleHeightScale (embedded): restore done track=\(capturedTrack) vlcAfter=\(self.vlcMediaPlayer.currentVideoSubTitleIndex)")
-                }
+                self.retryRestoreSubtitleTrack(
+                    trackIndex: capturedTrack,
+                    trackLabel: capturedLabel,
+                    audioTrack: capturedAudio,
+                    remainingAttempts: 20
+                )
             }
         }
         pendingSubtitleSizeRestore = workItem
