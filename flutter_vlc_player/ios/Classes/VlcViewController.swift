@@ -596,7 +596,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         media.addOption(":sub-track-id=\(trackIndex)")
         media.addOption(":sout=#transcode{vcodec=none,acodec=none,scodec=txt}:std{access=file,mux=raw,dst=\(dstPath)}")
 
-        let extractor = VLCMediaPlayer(library: vlcMediaPlayer.library)
+        let extractor = VLCMediaPlayer(library: VLCLibrary.shared())
         extractor.media = media
         subtitleExtractor = extractor
 
