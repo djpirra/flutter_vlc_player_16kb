@@ -349,9 +349,27 @@ public class VLCViewController: NSObject, FlutterPlatformView {
                 guard let self else { return }
                 // Re-inject option immediately before the new decoder opens.
                 self.vlcMediaPlayer.media?.addOption(":freetype-rel-fontsize=\(capturedRelSize)")
-                // Re-adding the same slave URL forces VLC to open a fresh subtitle
-                // ES decoder, which reads the updated freetype option.
-                self.vlcMediaPlayer.addPlaybackSlave(externalUrl, type: .subtitle, enforce: true)
+
+                // VLC deduplicates slave URLs — re-adding the exact same URL
+                // switches to the existing decoder (opened with the OLD font size)
+                // rather than creating a new one.  Appending a millisecond
+                // timestamp makes VLC treat it as a fresh resource so it opens
+                // a new FreeType decoder that picks up the updated font-size option.
+                // Jellyfin ignores the unknown `_t` parameter and returns the
+                // same SRT content.
+                let ts = Int(Date().timeIntervalSince1970 * 1000)
+                let bustUrl: URL
+                if var comps = URLComponents(url: externalUrl, resolvingAgainstBaseURL: false) {
+                    var items = comps.queryItems ?? []
+                    items.removeAll { $0.name == "_t" }
+                    items.append(URLQueryItem(name: "_t", value: "\(ts)"))
+                    comps.queryItems = items
+                    bustUrl = comps.url ?? externalUrl
+                } else {
+                    bustUrl = externalUrl
+                }
+
+                self.vlcMediaPlayer.addPlaybackSlave(bustUrl, type: .subtitle, enforce: true)
                 print("[VLC-SPU] setSubtitleHeightScale (external): re-added slave relSize=\(capturedRelSize) vlcAfter=\(self.vlcMediaPlayer.currentVideoSubTitleIndex)")
             }
             pendingSubtitleSizeRestore = workItem
