@@ -57,6 +57,14 @@ public class VLCViewController: NSObject, FlutterPlatformView {
     private var lastKnownDuration: Int = 0
     private var lastKnownIsPlaying: Bool = false
 
+    // Last media load parameters — stored so setSubtitleHeightScale can reload
+    // the same media with an updated freetype-rel-fontsize when the embedded-
+    // subtitle fallback is needed (toggle does not restart the FreeType renderer).
+    private var lastMediaUri: String = ""
+    private var lastMediaIsAsset: Bool = false
+    private var lastMediaHwAcc: Int = 0
+    private var lastMediaOptions: [String] = []
+
     public func view() -> UIView {
         return self.hostedView
     }
@@ -295,10 +303,27 @@ public class VLCViewController: NSObject, FlutterPlatformView {
             print("[VLC-SPU] addSubtitleTrack: network URL — downloading \(url.lastPathComponent)")
             downloadSubtitleThenAdd(networkUrl: url, isSelected: isSelected)
         } else {
-            // Already a local file path — add directly.
-            lastExternalSubtitleUrl = url
-            if let data = try? Data(contentsOf: url) { lastExternalSubtitleData = data }
-            _doAddSubtitleSlave(localUrl: url, isSelected: isSelected)
+            // Local file — read bytes, convert SRT→ASS with font size baked in (same
+            // pipeline as network subtitles) so resize works for OpenSubtitles files
+            // and any other locally-cached subtitle source (XTREAM, Smart Collections).
+            guard let data = try? Data(contentsOf: url), !data.isEmpty else {
+                print("[VLC-SPU] addSubtitleTrack: could not read local file \(url.lastPathComponent)")
+                return
+            }
+            self.lastExternalSubtitleData = data
+            let srtString = String(data: data, encoding: .utf8)
+                          ?? String(data: data, encoding: .isoLatin1)
+                          ?? ""
+            let assData = srtString.isEmpty
+                ? data
+                : (srtToAssData(srtContent: srtString, relFontSize: subtitleRelSize) ?? data)
+            let ext = srtString.isEmpty ? url.pathExtension.lowercased().isEmpty ? "srt" : url.pathExtension.lowercased() : "ass"
+            guard let tmpUrl = writeTempSubtitleFile(data: assData, ext: ext) else {
+                print("[VLC-SPU] addSubtitleTrack: writeTempSubtitleFile failed for \(url.lastPathComponent)")
+                return
+            }
+            lastExternalSubtitleUrl = tmpUrl
+            _doAddSubtitleSlave(localUrl: tmpUrl, isSelected: isSelected)
         }
     }
 
@@ -341,10 +366,10 @@ public class VLCViewController: NSObject, FlutterPlatformView {
     /// option (which is only a fallback for formats that don't declare a size).
     ///
     /// Coordinate space: PlayResY=1000.  Font sizes map as:
-    ///   `freetype-rel-fontsize N` (= N% of video height) → Fontsize = N * 10
-    ///   e.g. relSize 10 → ASS Fontsize 100  (10% of 1000-unit vertical space)
+    ///   `freetype-rel-fontsize N` (= N% of video height) → Fontsize = N * 5
+    ///   e.g. relSize 10 → ASS Fontsize 50  (5% of 1000-unit vertical space = VLC default)
     private func srtToAssData(srtContent: String, relFontSize: Int) -> Data? {
-        let assFontSize = max(10, relFontSize * 10)
+        let assFontSize = max(5, relFontSize * 5)
 
         let header = """
 [Script Info]
@@ -390,6 +415,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             dialogues.append("Dialogue: 0,\(start),\(end),Default,,0,0,0,,\(text)")
         }
 
+        guard !dialogues.isEmpty else {
+            // Not a valid SRT file — return nil so the caller falls back to the
+            // original bytes (e.g. a natively-formatted ASS file).
+            print("[VLC-SPU] srtToAssData: no SRT blocks parsed — falling back to original data")
+            return nil
+        }
         let ass = header + "\n" + dialogues.joined(separator: "\n")
         return ass.data(using: .utf8)
     }
@@ -462,21 +493,20 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         pendingSubtitleSizeRestore?.cancel()
 
         // ── Strategy ─────────────────────────────────────────────────────────
-        // In MobileVLCKit 3, toggling currentVideoSubTitleIndex from -1 back to
-        // a valid index only HIDES then SHOWS the existing subtitle renderer — it
-        // does NOT restart the ES decoder, so it never re-reads freetype options.
-        //
-        // The only reliable way to make a live font-size change visible is to
-        // force VLC to open a *new* subtitle ES decoder.
+        // In MobileVLCKit 3, the FreeType text renderer is a vout-level module
+        // initialized ONCE per playback session — `freetype-rel-fontsize` is
+        // read in `freetype_Create()` and never re-read for the same vout.
         //
         // • External subtitle (added via addPlaybackSlave / addSubtitleTrack):
-        //   Re-add the same slave URL with enforce=true.  VLC creates a fresh
-        //   decoder for that file that reads the updated freetype-rel-fontsize.
+        //   Re-write the SRT bytes as a new ASS temp file with Fontsize baked into
+        //   the style header, then re-add the slave.  VLC parses Fontsize from the
+        //   file itself, bypassing the FreeType renderer option entirely.
         //
-        // • Embedded / unknown subtitle (IPTV embedded text, etc.):
-        //   Fall back to the toggle approach with a longer delay.
-        //   Note: bitmap subtitles (DVB, PGS, VobSub) are NOT rendered by
-        //   FreeType at all – their size cannot be changed this way.
+        // • Embedded subtitle (XTREAM IPTV / Smart Collections container tracks):
+        //   The FreeType renderer cannot be resized without reinitializing the vout.
+        //   Solution: reload the media with the new freetype-rel-fontsize, then seek
+        //   back to the saved position and restore track selections.  The reload is
+        //   debounced 1.5 s so rapid +/- taps only fire once.
         // ─────────────────────────────────────────────────────────────────────
 
         if let subData = lastExternalSubtitleData {
@@ -495,11 +525,17 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 let srtString = String(data: subData, encoding: .utf8)
                               ?? String(data: subData, encoding: .isoLatin1)
                               ?? ""
-                let assData = srtString.isEmpty
-                    ? subData
-                    : (self.srtToAssData(srtContent: srtString, relFontSize: capturedRelSize) ?? subData)
-                let ext = srtString.isEmpty ? "srt" : "ass"
-                guard let newTmpUrl = self.writeTempSubtitleFile(data: assData, ext: ext) else { return }
+                guard let assData = srtString.isEmpty ? nil : self.srtToAssData(srtContent: srtString, relFontSize: capturedRelSize) else {
+                    // Not a recognised SRT file (e.g. native ASS); font-size cannot be
+                    // dynamically changed for this format.  Re-add the original bytes so
+                    // the subtitle at least continues to show.
+                    print("[VLC-SPU] setSubtitleHeightScale (external): non-SRT data, skipping resize")
+                    if let fallbackUrl = self.writeTempSubtitleFile(data: subData, ext: self.lastExternalSubtitleUrl?.pathExtension ?? "srt") {
+                        self.vlcMediaPlayer.addPlaybackSlave(fallbackUrl, type: .subtitle, enforce: true)
+                    }
+                    return
+                }
+                guard let newTmpUrl = self.writeTempSubtitleFile(data: assData, ext: "ass") else { return }
                 self.lastExternalSubtitleUrl = newTmpUrl
                 print("[VLC-SPU] setSubtitleHeightScale (external): re-adding relSize=\(capturedRelSize) file=\(newTmpUrl.lastPathComponent)")
                 self.vlcMediaPlayer.addPlaybackSlave(newTmpUrl, type: .subtitle, enforce: true)
@@ -513,8 +549,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             return
         }
 
-        // Embedded subtitle fallback: toggle track index to force VLC to close
-        // and reopen the FreeType decoder with the new freetype-rel-fontsize.
+        // Embedded subtitle fallback: the VLC FreeType text renderer is a vout-level
+        // module that is initialized ONCE per playback session — track toggling only
+        // closes/reopens the ES decoder but reuses the same renderer.  The only
+        // reliable way to change the font size for embedded tracks is to reload the
+        // media from the current position with the updated freetype-rel-fontsize.
+        //
+        // The work item is debounced (1.5 s) so rapid +/- taps only fire once.
         let trackToRestore: Int32
         let vlcRealIndex = self.vlcMediaPlayer.currentVideoSubTitleIndex
         if let last = lastSetSpuTrackId, last >= 0 {
@@ -527,24 +568,64 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             }
             trackToRestore = vlcRealIndex
         }
-        print("[VLC-SPU] setSubtitleHeightScale (embedded): relSize=\(relSize) vlcReal=\(vlcRealIndex) → toggling track \(trackToRestore)")
+        guard !lastMediaUri.isEmpty else { return }
 
-        // Inject the new font-size option NOW, before disabling the track, so
-        // the value is in the media options dict when the decoder re-initialises.
-        self.vlcMediaPlayer.media?.addOption(":freetype-rel-fontsize=\(relSize)")
-        self.vlcMediaPlayer.currentVideoSubTitleIndex = -1
+        print("[VLC-SPU] setSubtitleHeightScale (embedded): relSize=\(relSize) vlcReal=\(vlcRealIndex) → scheduling reload for track \(trackToRestore)")
+
+        let capturedRelSize = relSize
+        let capturedTrack   = trackToRestore
+        let capturedAudio   = Int32(self.vlcMediaPlayer.selectedAudioTrackIndex)
+        let capturedPos     = Int64(self.lastKnownPosition)
+        let capturedUri     = lastMediaUri
+        let capturedIsAsset = lastMediaIsAsset
+        let capturedHwAcc   = lastMediaHwAcc
+        let capturedOptions = lastMediaOptions
 
         let workItem = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            // Inject again immediately before re-enabling as a belt-and-suspenders guard.
-            self.vlcMediaPlayer.media?.addOption(":freetype-rel-fontsize=\(relSize)")
-            self.vlcMediaPlayer.currentVideoSubTitleIndex = trackToRestore
-            print("[VLC-SPU] setSubtitleHeightScale (embedded): restored trackId=\(trackToRestore) vlcAfter=\(self.vlcMediaPlayer.currentVideoSubTitleIndex)")
+            print("[VLC-SPU] setSubtitleHeightScale (embedded): reloading media relSize=\(capturedRelSize) pos=\(capturedPos)ms")
+
+            // Build a fresh VLCMedia with the updated freetype option.
+            var media: VLCMedia?
+            if capturedIsAsset {
+                if let path = Bundle.main.path(forResource: capturedUri, ofType: nil) {
+                    media = VLCMedia(path: path)
+                }
+            } else if let url = URL(string: capturedUri) {
+                media = VLCMedia(url: url)
+            }
+            guard let media else { return }
+            for opt in capturedOptions { media.addOption(opt) }
+            media.addOption(":freetype-rel-fontsize=\(capturedRelSize)")
+            self.subtitleRelSize = capturedRelSize
+
+            self.mediaEventChannelHandler.beginPlaybackMutation()
+            self.vlcMediaPlayer.stop()
+            self.vlcMediaPlayer.media = media
+            self.vlcMediaPlayer.play()
+            self.mediaEventChannelHandler.endPlaybackMutation()
+
+            // After the stream begins buffering, seek to the saved position
+            // and restore the subtitle + audio track selections.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                guard let self else { return }
+                self.executeSeek(position: capturedPos)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                    guard let self else { return }
+                    if capturedAudio >= 0 {
+                        self.vlcMediaPlayer.selectAudioTrack(at: Int(capturedAudio))
+                    }
+                    if capturedTrack >= 0 {
+                        self.vlcMediaPlayer.currentVideoSubTitleIndex = capturedTrack
+                        self.lastSetSpuTrackId = capturedTrack
+                    }
+                    print("[VLC-SPU] setSubtitleHeightScale (embedded): restore done track=\(capturedTrack) vlcAfter=\(self.vlcMediaPlayer.currentVideoSubTitleIndex)")
+                }
+            }
         }
         pendingSubtitleSizeRestore = workItem
-        // 600 ms gives VLC enough time to fully deactivate the ES decoder before
-        // we re-enable it. 500 ms occasionally races the decoder shutdown.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: workItem)
+        // 1.5 s debounce: absorbs rapid +/− taps so only the final size fires the reload.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: workItem)
     }
     
     public var audioTracksCount: Int32 {
@@ -705,6 +786,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         lastExternalSubtitleData = nil
         pendingSubtitleSizeRestore?.cancel()
         pendingSubtitleSizeRestore = nil
+        // Remember the load parameters so we can reload for embedded subtitle resize.
+        lastMediaUri = uri
+        lastMediaIsAsset = isAssetUrl
+        lastMediaHwAcc = hwAcc
+        lastMediaOptions = options
         // Block and drain time/state read work while stop/media swap runs so
         // vlcReadQueue never touches VLCMediaPlayer after libvlc teardown starts.
         self.mediaEventChannelHandler.beginPlaybackMutation()
