@@ -40,10 +40,17 @@ public class VLCViewController: NSObject, FlutterPlatformView {
     private var pendingSubtitleSizeRestore: DispatchWorkItem? = nil
 
     // Last external subtitle URL added via addSubtitleTrack.
-    // Used by setSubtitleHeightScale to re-add the slave (forcing a fresh
-    // subtitle ES decoder that reads the updated freetype-rel-fontsize option).
+    // For network URLs this will be a LOCAL temp file path after the async
+    // download completes.  Used by setSubtitleHeightScale to re-add the slave.
     // Reset on every new media load.
     private var lastExternalSubtitleUrl: URL? = nil
+
+    // Raw bytes of the last external subtitle that was downloaded.
+    // Cached so setSubtitleHeightScale can write a NEW temp file without
+    // making a second network request — only a fast local write is needed
+    // to give VLC a unique URL that forces a fresh FreeType decoder.
+    // Reset on every new media load.
+    private var lastExternalSubtitleData: Data? = nil
     
     // Caches — updated only from safe contexts, read from main thread
     private var lastKnownPosition: Int = 0
@@ -279,17 +286,151 @@ public class VLCViewController: NSObject, FlutterPlatformView {
         guard let url = URL(string: uri) else { return }
         // Apply the current font size before the external subtitle track opens.
         self.vlcMediaPlayer.media?.addOption(":freetype-rel-fontsize=\(subtitleRelSize)")
-        // Store the URL so setSubtitleHeightScale can re-add this slave to force
-        // a new subtitle ES decoder (the only reliable live resize in MobileVLCKit 3).
-        lastExternalSubtitleUrl = url
+
+        if url.scheme == "http" || url.scheme == "https" {
+            // Network subtitles: VLC's addPlaybackSlave silently fails for HTTP
+            // URLs in some MobileVLCKit 3 configurations.  Download the SRT to a
+            // local temp file first — local-file addPlaybackSlave is reliable and
+            // enables fast resize (just write cached bytes to a new temp path).
+            print("[VLC-SPU] addSubtitleTrack: network URL — downloading \(url.lastPathComponent)")
+            downloadSubtitleThenAdd(networkUrl: url, isSelected: isSelected)
+        } else {
+            // Already a local file path — add directly.
+            lastExternalSubtitleUrl = url
+            if let data = try? Data(contentsOf: url) { lastExternalSubtitleData = data }
+            _doAddSubtitleSlave(localUrl: url, isSelected: isSelected)
+        }
+    }
+
+    /// Downloads a subtitle from [networkUrl] to a unique temp ASS file (converted
+    /// from SRT), then adds it via addPlaybackSlave on the main thread.
+    private func downloadSubtitleThenAdd(networkUrl: URL, isSelected: Bool) {
+        URLSession.shared.dataTask(with: networkUrl) { [weak self] data, _, error in
+            guard let self else { return }
+            if let error = error {
+                print("[VLC-SPU] downloadSubtitleThenAdd: download failed: \(error.localizedDescription)")
+                return
+            }
+            guard let data = data, !data.isEmpty else {
+                print("[VLC-SPU] downloadSubtitleThenAdd: empty response for \(networkUrl.lastPathComponent)")
+                return
+            }
+            // Cache raw SRT bytes so we can regenerate ASS with any font size later.
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.lastExternalSubtitleData = data
+                // Convert SRT → ASS with the current font size baked into the style.
+                let srtString = String(data: data, encoding: .utf8)
+                              ?? String(data: data, encoding: .isoLatin1)
+                              ?? ""
+                let assData = srtString.isEmpty
+                    ? data
+                    : (self.srtToAssData(srtContent: srtString, relFontSize: self.subtitleRelSize) ?? data)
+                let ext = srtString.isEmpty ? "srt" : "ass"
+                guard let tmpUrl = self.writeTempSubtitleFile(data: assData, ext: ext) else { return }
+                self.lastExternalSubtitleUrl = tmpUrl
+                self._doAddSubtitleSlave(localUrl: tmpUrl, isSelected: isSelected)
+            }
+        }.resume()
+    }
+
+    /// Converts SRT-formatted string to ASS subtitle data with an explicit font size.
+    ///
+    /// ASS subtitles embed `Fontsize` in the style header which VLC reads from
+    /// the file at parse time — independent of the `freetype-rel-fontsize` media
+    /// option (which is only a fallback for formats that don't declare a size).
+    ///
+    /// Coordinate space: PlayResY=1000.  Font sizes map as:
+    ///   `freetype-rel-fontsize N` (= N% of video height) → Fontsize = N * 10
+    ///   e.g. relSize 10 → ASS Fontsize 100  (10% of 1000-unit vertical space)
+    private func srtToAssData(srtContent: String, relFontSize: Int) -> Data? {
+        let assFontSize = max(10, relFontSize * 10)
+
+        let header = """
+[Script Info]
+ScriptType: v4.00+
+WrapStyle: 0
+PlayResX: 1777
+PlayResY: 1000
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,\(assFontSize),&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,2,0,2,20,20,20,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+        var dialogues: [String] = []
+
+        // SRT blocks are separated by blank lines.
+        let blocks = srtContent.components(separatedBy: "\n\n")
+        for block in blocks {
+            let lines = block.trimmingCharacters(in: .whitespacesAndNewlines)
+                             .components(separatedBy: "\n")
+            guard lines.count >= 3 else { continue }
+
+            // Line 1: timestamps "HH:MM:SS,mmm --> HH:MM:SS,mmm"
+            let timeParts = lines[1].components(separatedBy: " --> ")
+            guard timeParts.count == 2,
+                  let start = srtTimeToAss(timeParts[0].trimmingCharacters(in: .whitespaces)),
+                  let end   = srtTimeToAss(timeParts[1].trimmingCharacters(in: .whitespaces))
+            else { continue }
+
+            // Lines 2+: subtitle text — convert basic HTML tags to ASS overrides.
+            var text = lines[2...].joined(separator: "\\N")
+            text = text.replacingOccurrences(of: "<i>",  with: "{\\i1}")
+            text = text.replacingOccurrences(of: "</i>", with: "{\\i0}")
+            text = text.replacingOccurrences(of: "<b>",  with: "{\\b1}")
+            text = text.replacingOccurrences(of: "</b>", with: "{\\b0}")
+            // Strip any remaining HTML-like tags.
+            text = text.replacingOccurrences(of: "<[^>]+>",
+                                              with: "",
+                                              options: .regularExpression)
+
+            dialogues.append("Dialogue: 0,\(start),\(end),Default,,0,0,0,,\(text)")
+        }
+
+        let ass = header + "\n" + dialogues.joined(separator: "\n")
+        return ass.data(using: .utf8)
+    }
+
+    /// Converts an SRT timestamp "HH:MM:SS,mmm" to ASS format "H:MM:SS.cc".
+    private func srtTimeToAss(_ srt: String) -> String? {
+        let parts = srt.components(separatedBy: ",")
+        guard parts.count == 2 else { return nil }
+        let hms = parts[0]          // "01:23:45"
+        let ms  = parts[1]          // "678"
+        let cs  = String(ms.prefix(2).padding(toLength: 2, withPad: "0", startingAt: 0))
+        // ASS hours have no leading zero.
+        let hmsParts = hms.components(separatedBy: ":")
+        guard hmsParts.count == 3 else { return nil }
+        let h = Int(hmsParts[0]) ?? 0
+        return "\(h):\(hmsParts[1]):\(hmsParts[2]).\(cs)"
+    }
+
+    /// Writes [data] to a unique temp file with the given extension and returns its URL.
+    private func writeTempSubtitleFile(data: Data, ext: String = "ass") -> URL? {
+        let ts  = Int(Date().timeIntervalSince1970 * 1000)
+        let tmp = (NSTemporaryDirectory() as NSString).appendingPathComponent("gs_sub_\(ts).\(ext)")
+        let url = URL(fileURLWithPath: tmp)
+        do {
+            try data.write(to: url, options: .atomic)
+            return url
+        } catch {
+            print("[VLC-SPU] writeTempSubtitleFile: write failed: \(error)")
+            return nil
+        }
+    }
+
+    /// Core addPlaybackSlave call with before/after logging.
+    private func _doAddSubtitleSlave(localUrl: URL, isSelected: Bool) {
         let tracksBefore = self.vlcMediaPlayer.videoSubTitlesNames ?? []
-        print("[VLC-SPU] addSubtitleTrack: uri=\(url.lastPathComponent) enforce=\(isSelected) tracksBefore=\(tracksBefore)")
-        self.vlcMediaPlayer.addPlaybackSlave(url, type: .subtitle, enforce: isSelected)
-        // Log tracks after a short delay so VLC has time to register the new track.
+        print("[VLC-SPU] addSubtitleSlave: file=\(localUrl.lastPathComponent) enforce=\(isSelected) tracksBefore.count=\(tracksBefore.count)")
+        self.vlcMediaPlayer.addPlaybackSlave(localUrl, type: .subtitle, enforce: isSelected)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self else { return }
             let tracksAfter = self.vlcMediaPlayer.videoSubTitlesNames ?? []
-            print("[VLC-SPU] addSubtitleTrack: tracksAfter(0.5s)=\(tracksAfter) currentIndex=\(self.vlcMediaPlayer.currentVideoSubTitleIndex)")
+            print("[VLC-SPU] addSubtitleSlave: tracksAfter(0.5s).count=\(tracksAfter.count) currentIndex=\(self.vlcMediaPlayer.currentVideoSubTitleIndex)")
         }
     }
     
@@ -338,46 +479,42 @@ public class VLCViewController: NSObject, FlutterPlatformView {
         //   FreeType at all – their size cannot be changed this way.
         // ─────────────────────────────────────────────────────────────────────
 
-        if let externalUrl = lastExternalSubtitleUrl {
+        if let subData = lastExternalSubtitleData {
             let capturedRelSize = relSize
-            print("[VLC-SPU] setSubtitleHeightScale (external): relSize=\(relSize) url=\(externalUrl.lastPathComponent)")
+            print("[VLC-SPU] setSubtitleHeightScale (external): relSize=\(relSize)")
 
             // Briefly hide the current subtitle so there's no flash of old-size text.
             self.vlcMediaPlayer.currentVideoSubTitleIndex = -1
 
             let workItem = DispatchWorkItem { [weak self] in
                 guard let self else { return }
-                // Re-inject option immediately before the new decoder opens.
-                self.vlcMediaPlayer.media?.addOption(":freetype-rel-fontsize=\(capturedRelSize)")
-
-                // VLC deduplicates slave URLs — re-adding the exact same URL
-                // switches to the existing decoder (opened with the OLD font size)
-                // rather than creating a new one.  Appending a millisecond
-                // timestamp makes VLC treat it as a fresh resource so it opens
-                // a new FreeType decoder that picks up the updated font-size option.
-                // Jellyfin ignores the unknown `_t` parameter and returns the
-                // same SRT content.
-                let ts = Int(Date().timeIntervalSince1970 * 1000)
-                let bustUrl: URL
-                if var comps = URLComponents(url: externalUrl, resolvingAgainstBaseURL: false) {
-                    var items = comps.queryItems ?? []
-                    items.removeAll { $0.name == "_t" }
-                    items.append(URLQueryItem(name: "_t", value: "\(ts)"))
-                    comps.queryItems = items
-                    bustUrl = comps.url ?? externalUrl
-                } else {
-                    bustUrl = externalUrl
+                // Regenerate ASS from cached SRT bytes with the NEW font size.
+                // ASS Fontsize is baked into the file content so VLC reads it
+                // fresh — bypassing the freetype-rel-fontsize option which is
+                // only read once at decoder initialization and cannot be changed.
+                let srtString = String(data: subData, encoding: .utf8)
+                              ?? String(data: subData, encoding: .isoLatin1)
+                              ?? ""
+                let assData = srtString.isEmpty
+                    ? subData
+                    : (self.srtToAssData(srtContent: srtString, relFontSize: capturedRelSize) ?? subData)
+                let ext = srtString.isEmpty ? "srt" : "ass"
+                guard let newTmpUrl = self.writeTempSubtitleFile(data: assData, ext: ext) else { return }
+                self.lastExternalSubtitleUrl = newTmpUrl
+                print("[VLC-SPU] setSubtitleHeightScale (external): re-adding relSize=\(capturedRelSize) file=\(newTmpUrl.lastPathComponent)")
+                self.vlcMediaPlayer.addPlaybackSlave(newTmpUrl, type: .subtitle, enforce: true)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                    guard let self else { return }
+                    print("[VLC-SPU] setSubtitleHeightScale (external): vlcAfter(0.5s)=\(self.vlcMediaPlayer.currentVideoSubTitleIndex)")
                 }
-
-                self.vlcMediaPlayer.addPlaybackSlave(bustUrl, type: .subtitle, enforce: true)
-                print("[VLC-SPU] setSubtitleHeightScale (external): re-added slave relSize=\(capturedRelSize) vlcAfter=\(self.vlcMediaPlayer.currentVideoSubTitleIndex)")
             }
             pendingSubtitleSizeRestore = workItem
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: workItem)
             return
         }
 
-        // Embedded subtitle fallback: toggle track index with a longer delay.
+        // Embedded subtitle fallback: toggle track index to force VLC to close
+        // and reopen the FreeType decoder with the new freetype-rel-fontsize.
         let trackToRestore: Int32
         let vlcRealIndex = self.vlcMediaPlayer.currentVideoSubTitleIndex
         if let last = lastSetSpuTrackId, last >= 0 {
@@ -390,18 +527,24 @@ public class VLCViewController: NSObject, FlutterPlatformView {
             }
             trackToRestore = vlcRealIndex
         }
-        print("[VLC-SPU] setSubtitleHeightScale (embedded): relSize=\(relSize) vlcReal=\(vlcRealIndex) → toggle track \(trackToRestore)")
+        print("[VLC-SPU] setSubtitleHeightScale (embedded): relSize=\(relSize) vlcReal=\(vlcRealIndex) → toggling track \(trackToRestore)")
 
+        // Inject the new font-size option NOW, before disabling the track, so
+        // the value is in the media options dict when the decoder re-initialises.
+        self.vlcMediaPlayer.media?.addOption(":freetype-rel-fontsize=\(relSize)")
         self.vlcMediaPlayer.currentVideoSubTitleIndex = -1
 
         let workItem = DispatchWorkItem { [weak self] in
             guard let self else { return }
+            // Inject again immediately before re-enabling as a belt-and-suspenders guard.
             self.vlcMediaPlayer.media?.addOption(":freetype-rel-fontsize=\(relSize)")
             self.vlcMediaPlayer.currentVideoSubTitleIndex = trackToRestore
             print("[VLC-SPU] setSubtitleHeightScale (embedded): restored trackId=\(trackToRestore) vlcAfter=\(self.vlcMediaPlayer.currentVideoSubTitleIndex)")
         }
         pendingSubtitleSizeRestore = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: workItem)
+        // 600 ms gives VLC enough time to fully deactivate the ES decoder before
+        // we re-enable it. 500 ms occasionally races the decoder shutdown.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: workItem)
     }
     
     public var audioTracksCount: Int32 {
@@ -559,6 +702,7 @@ public class VLCViewController: NSObject, FlutterPlatformView {
         // into the new one.
         lastSetSpuTrackId = nil
         lastExternalSubtitleUrl = nil
+        lastExternalSubtitleData = nil
         pendingSubtitleSizeRestore?.cancel()
         pendingSubtitleSizeRestore = nil
         // Block and drain time/state read work while stop/media swap runs so
