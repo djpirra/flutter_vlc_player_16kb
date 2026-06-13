@@ -34,6 +34,16 @@ public class VLCViewController: NSObject, FlutterPlatformView {
     // Guards to prevent seek flooding (main-thread only)
     private var isSeekInFlight: Bool = false
     private var coalescedSeekTarget: Int64? = nil
+
+    // Pending subtitle-size restore work item – cancelled when a newer resize
+    // arrives so only the final tap in a rapid sequence fires the decoder restart.
+    private var pendingSubtitleSizeRestore: DispatchWorkItem? = nil
+
+    // Last external subtitle URL added via addSubtitleTrack.
+    // Used by setSubtitleHeightScale to re-add the slave (forcing a fresh
+    // subtitle ES decoder that reads the updated freetype-rel-fontsize option).
+    // Reset on every new media load.
+    private var lastExternalSubtitleUrl: URL? = nil
     
     // Caches — updated only from safe contexts, read from main thread
     private var lastKnownPosition: Int = 0
@@ -269,6 +279,9 @@ public class VLCViewController: NSObject, FlutterPlatformView {
         guard let url = URL(string: uri) else { return }
         // Apply the current font size before the external subtitle track opens.
         self.vlcMediaPlayer.media?.addOption(":freetype-rel-fontsize=\(subtitleRelSize)")
+        // Store the URL so setSubtitleHeightScale can re-add this slave to force
+        // a new subtitle ES decoder (the only reliable live resize in MobileVLCKit 3).
+        lastExternalSubtitleUrl = url
         let tracksBefore = self.vlcMediaPlayer.videoSubTitlesNames ?? []
         print("[VLC-SPU] addSubtitleTrack: uri=\(url.lastPathComponent) enforce=\(isSelected) tracksBefore=\(tracksBefore)")
         self.vlcMediaPlayer.addPlaybackSlave(url, type: .subtitle, enforce: isSelected)
@@ -301,16 +314,49 @@ public class VLCViewController: NSObject, FlutterPlatformView {
         // open (on track selection or media re-open) picks up the correct size.
         self.vlcMediaPlayer.media?.addOption(":freetype-rel-fontsize=\(relSize)")
 
-        // Best-effort live update: toggling the active track causes VLC to
-        // close and reopen the subtitle ES decoder, which re-reads per-item
-        // options including the new font size. This works for text-based tracks
-        // (SRT, ASS); bitmap/vobsub tracks are unaffected by freetype options.
+        // Cancel any previous pending restore so rapid slider taps only fire once.
+        pendingSubtitleSizeRestore?.cancel()
+
+        // ── Strategy ─────────────────────────────────────────────────────────
+        // In MobileVLCKit 3, toggling currentVideoSubTitleIndex from -1 back to
+        // a valid index only HIDES then SHOWS the existing subtitle renderer — it
+        // does NOT restart the ES decoder, so it never re-reads freetype options.
         //
-        // Prefer lastSetSpuTrackId over currentVideoSubTitleIndex because VLC's
-        // internal index may not have committed yet when this is called immediately
-        // after selectSubtitleTrack(at:). Using the stale internal index would
-        // restore the previously-active track (e.g. a Persian embedded subtitle)
-        // instead of the newly selected external one.
+        // The only reliable way to make a live font-size change visible is to
+        // force VLC to open a *new* subtitle ES decoder.
+        //
+        // • External subtitle (added via addPlaybackSlave / addSubtitleTrack):
+        //   Re-add the same slave URL with enforce=true.  VLC creates a fresh
+        //   decoder for that file that reads the updated freetype-rel-fontsize.
+        //
+        // • Embedded / unknown subtitle (IPTV embedded text, etc.):
+        //   Fall back to the toggle approach with a longer delay.
+        //   Note: bitmap subtitles (DVB, PGS, VobSub) are NOT rendered by
+        //   FreeType at all – their size cannot be changed this way.
+        // ─────────────────────────────────────────────────────────────────────
+
+        if let externalUrl = lastExternalSubtitleUrl {
+            let capturedRelSize = relSize
+            print("[VLC-SPU] setSubtitleHeightScale (external): relSize=\(relSize) url=\(externalUrl.lastPathComponent)")
+
+            // Briefly hide the current subtitle so there's no flash of old-size text.
+            self.vlcMediaPlayer.currentVideoSubTitleIndex = -1
+
+            let workItem = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                // Re-inject option immediately before the new decoder opens.
+                self.vlcMediaPlayer.media?.addOption(":freetype-rel-fontsize=\(capturedRelSize)")
+                // Re-adding the same slave URL forces VLC to open a fresh subtitle
+                // ES decoder, which reads the updated freetype option.
+                self.vlcMediaPlayer.addPlaybackSlave(externalUrl, type: .subtitle, enforce: true)
+                print("[VLC-SPU] setSubtitleHeightScale (external): re-added slave relSize=\(capturedRelSize) vlcAfter=\(self.vlcMediaPlayer.currentVideoSubTitleIndex)")
+            }
+            pendingSubtitleSizeRestore = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: workItem)
+            return
+        }
+
+        // Embedded subtitle fallback: toggle track index with a longer delay.
         let trackToRestore: Int32
         let vlcRealIndex = self.vlcMediaPlayer.currentVideoSubTitleIndex
         if let last = lastSetSpuTrackId, last >= 0 {
@@ -323,16 +369,18 @@ public class VLCViewController: NSObject, FlutterPlatformView {
             }
             trackToRestore = vlcRealIndex
         }
-        print("[VLC-SPU] setSubtitleHeightScale: relSize=\(relSize) lastSet=\(String(describing: lastSetSpuTrackId)) vlcReal=\(vlcRealIndex) → restoring positional=\(trackToRestore)")
+        print("[VLC-SPU] setSubtitleHeightScale (embedded): relSize=\(relSize) vlcReal=\(vlcRealIndex) → toggle track \(trackToRestore)")
 
         self.vlcMediaPlayer.currentVideoSubTitleIndex = -1
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+
+        let workItem = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            // trackToRestore is already a VLC internal ID (from lastSetSpuTrackId or
-            // currentVideoSubTitleIndex), so assign it directly.
+            self.vlcMediaPlayer.media?.addOption(":freetype-rel-fontsize=\(relSize)")
             self.vlcMediaPlayer.currentVideoSubTitleIndex = trackToRestore
-            print("[VLC-SPU] setSubtitleHeightScale: restored internalId=\(trackToRestore), vlcAfter=\(self.vlcMediaPlayer.currentVideoSubTitleIndex)")
+            print("[VLC-SPU] setSubtitleHeightScale (embedded): restored trackId=\(trackToRestore) vlcAfter=\(self.vlcMediaPlayer.currentVideoSubTitleIndex)")
         }
+        pendingSubtitleSizeRestore = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: workItem)
     }
     
     public var audioTracksCount: Int32 {
@@ -486,10 +534,12 @@ public class VLCViewController: NSObject, FlutterPlatformView {
     }
     
     func setMediaPlayerUrl(uri: String, isAssetUrl: Bool, autoPlay: Bool, hwAcc: Int, options: [String]) {
-        // Reset explicit-selection state so the first modal open after a media
-        // change reflects VLC's real currentVideoSubTitleIndex (e.g. a default
-        // track chosen by VLC) instead of the previous media's selection.
+        // Reset per-media state so values from a previous media item don't bleed
+        // into the new one.
         lastSetSpuTrackId = nil
+        lastExternalSubtitleUrl = nil
+        pendingSubtitleSizeRestore?.cancel()
+        pendingSubtitleSizeRestore = nil
         // Block and drain time/state read work while stop/media swap runs so
         // vlcReadQueue never touches VLCMediaPlayer after libvlc teardown starts.
         self.mediaEventChannelHandler.beginPlaybackMutation()
