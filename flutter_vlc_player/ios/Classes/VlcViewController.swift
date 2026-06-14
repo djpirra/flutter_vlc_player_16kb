@@ -272,11 +272,9 @@ public class VLCViewController: NSObject, FlutterPlatformView {
         // Keep this single log per selection (not in the hot polling path).
         print("[VLC-SPU] setSpuTrack: requested=\(spuTrackNumber) vlcBefore=\(before) vlcAfter=\(after)")
 
-        // Xtream / Smart Collections embedded subtitle resizing is handled in Dart:
-        // it downloads a plain SRT from the GridStreamr backend extraction endpoint
-        // (authenticated) and loads it as an external file via addSubtitleTrack,
-        // which lands on the external (resizable) path below. No native sidecar
-        // probing or media reload is performed here.
+        // Xtream / Smart Collections: embedded subtitle font-size resizing is not
+        // currently supported. Media reload is intentionally suppressed here to
+        // avoid HEVC decoder flicker on iOS with VLCKit 3.5.
     }
 
     private func isXtreamStyleMediaUri() -> Bool {
