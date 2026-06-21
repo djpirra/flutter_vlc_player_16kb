@@ -317,7 +317,26 @@ public class VLCViewController: NSObject, FlutterPlatformView {
             // local temp file first — local-file addPlaybackSlave is reliable and
             // enables fast resize (just write cached bytes to a new temp path).
             print("[VLC-SPU] addSubtitleTrack: network URL — downloading \(url.lastPathComponent)")
-            downloadSubtitleThenAdd(networkUrl: url, isSelected: isSelected)
+            // Signal that a download is in flight so setSubtitleHeightScale defers
+            // any scale change via pendingSubtitleScaleAfterPromotion instead of
+            // immediately triggering an embedded-subtitle media reload.
+            sidecarPromotionInProgress = true
+            downloadSubtitleThenAdd(networkUrl: url, isSelected: isSelected) { [weak self] success in
+                if !success {
+                    // Download failed (e.g. bitmap PGSSUB whose SRT URL returns 404,
+                    // or a transient network error).  Clear the in-progress flag and
+                    // record this track as "attempted but failed" so subsequent size
+                    // changes skip the pointless media-reload path.
+                    guard let self else { return }
+                    self.sidecarPromotionInProgress = false
+                    self.pendingSubtitleScaleAfterPromotion = nil
+                    let trackIndex = self.vlcMediaPlayer.currentVideoSubTitleIndex
+                    if trackIndex >= 0 {
+                        self.sidecarPromotionAttemptedForTrack = trackIndex
+                    }
+                    print("[VLC-SPU] addSubtitleTrack: sidecar download failed for \(url.lastPathComponent)")
+                }
+            }
         } else {
             // Local file — read bytes, convert SRT→ASS with font size baked in (same
             // pipeline as network subtitles) so resize works for OpenSubtitles files
@@ -629,6 +648,14 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         //   scale 1.5  (24 pt UI) → relSize 24   (very large)
         //   scale 2.0  (32 pt UI) → relSize 32   (enormous)
         let relSize = max(1, Int((scale * 16.0).rounded()))
+        // No-op guard: if the size hasn't changed and there is no external
+        // sidecar that needs its ASS file regenerated, skip everything.
+        // This prevents the embedded-subtitle media reload that would otherwise
+        // be triggered by color/direction-only changes (which also call
+        // setSubtitleHeightScale because _applySubtitleSettings always fires).
+        if relSize == subtitleRelSize && lastExternalSubtitleData == nil {
+            return
+        }
         subtitleRelSize = relSize
 
         // Persist as a per-item media option so every future subtitle decoder
@@ -730,12 +757,24 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             return
         }
 
+        // If a sidecar load was already attempted for this track and failed
+        // (e.g. a PGSSUB/bitmap track whose SRT URL returns 404, or any transient
+        // download error), skip the media reload.  FreeType font-size changes have
+        // no effect on bitmap subtitles, and reloading just restarts playback.
+        if let attempted = sidecarPromotionAttemptedForTrack,
+           attempted == Int32(trackToRestore) {
+            pendingSubtitleScaleAfterPromotion = nil
+            print("[VLC-SPU] setSubtitleHeightScale (embedded): skipped — sidecar previously failed for track \(trackToRestore)")
+            return
+        }
+
         print("[VLC-SPU] setSubtitleHeightScale (embedded): relSize=\(relSize) vlcReal=\(vlcRealIndex) → scheduling reload for track \(trackToRestore)")
 
         let capturedRelSize = relSize
         let capturedTrack   = trackToRestore
         let capturedAudio   = Int32(self.vlcMediaPlayer.selectedAudioTrackIndex)
         let capturedPos     = Int64(self.lastKnownPosition)
+        let capturedDuration = Int64(self.lastKnownDuration)
         let capturedUri     = lastMediaUri
         let capturedIsAsset = lastMediaIsAsset
         let capturedHwAcc   = lastMediaHwAcc
@@ -760,10 +799,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             guard let media else { return }
             for opt in capturedOptions { media.addOption(opt) }
             media.addOption(":freetype-rel-fontsize=\(capturedRelSize)")
-            // Bake the start position into the media so VLC begins playback at the
-            // right point without a separate async seek (avoids timing races).
-            let startTimeSec = max(0, (capturedPos - 2000)) / 1000   // 2 s back-buffer
-            media.addOption("--start-time=\(startTimeSec)")
+            // Note: --start-time= is NOT used here. It is only honoured by VLC
+            // for local files; for HTTP/network streams (e.g. Jellyfin direct
+            // stream) VLC always starts buffering from byte 0 and the option is
+            // silently ignored, resulting in playback starting at 00:00. Position
+            // is restored by an explicit seek below after VLC begins playing.
             self.subtitleRelSize = capturedRelSize
 
             self.mediaEventChannelHandler.beginPlaybackMutation()
@@ -772,10 +812,28 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             self.vlcMediaPlayer.play()
             self.mediaEventChannelHandler.endPlaybackMutation()
 
+            // Restore playback position via an explicit seek once VLC has
+            // started buffering the container. Use the float position (0…1)
+            // which works reliably for both local files and HTTP streams.
+            // 1.5 s gives VLC enough time to parse the container header and
+            // establish the HTTP connection before accepting a position seek.
+            // The subtitle/audio restore fires at 2.5 s, after the seek.
+            let duration = capturedDuration > 0 ? capturedDuration : Int64(self.lastKnownDuration)
+            if duration > 0 && capturedPos > 2000 {
+                let seekFraction = Float(capturedPos - 2000) / Float(duration)
+                if seekFraction > 0 && seekFraction < 1 {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                        guard let self else { return }
+                        self.vlcMediaPlayer.position = seekFraction
+                        print("[VLC-SPU] setSubtitleHeightScale (embedded): sought to \(seekFraction) after reload")
+                    }
+                }
+            }
+
             // Restore audio and subtitle track selections after VLC begins parsing
             // the container.  Prefer matching by label (survives index shifts);
             // fall back to the original index if no label was captured.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
                 guard let self else { return }
                 self.retryRestoreSubtitleTrack(
                     trackIndex: capturedTrack,
